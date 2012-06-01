@@ -1,0 +1,36 @@
+Creating a new elasticsearch distribution with grouping support
+
+
+In case you want to get up and runnign fast:
+
+* git clone git://github.com/lusini/elasticsearch-grouping-patches.git
+* cd elasticsearch-grouping-patches
+* ./build-patched-elasticsearch.sh
+* ls -l build/dist
+
+
+1. Get the source from the version you want to create from github
+   - Go to download and download a tag (not a binary release)
+     wget --no-check-certificate https://github.com/elasticsearch/elasticsearch/zipball/vX.YY.Z
+
+
+2. Unzip the source and create a copy from that in a similar named directory with an ".orig" suffix
+
+
+3. Try to apply the last patch from the patches/ directory
+
+   patch -p1 -i /path/to/patches/es-grouping-X.YY.Z.patch
+
+
+4. If the patch did not apply, check the conflicting files and change the source appropriately
+
+   When you are finished, create a new patch for the version by running
+
+   diff -Nur es-directory.orig es-directory > /path/to/patches/es-grouping-X.YY.Z.patch
+
+
+5. Build a custom version of elasticsearch
+
+   Before 0.19: gradle clean zip
+   Since 0.19:  mvn package -DskipTests
+

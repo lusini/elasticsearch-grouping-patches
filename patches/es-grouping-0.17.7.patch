@@ -1,0 +1,1938 @@
+diff -Nur elasticsearch-elasticsearch-1c16e45.orig/build.gradle elasticsearch-elasticsearch-1c16e45/build.gradle
+--- elasticsearch-elasticsearch-1c16e45.orig/build.gradle	2011-09-19 08:06:18.000000000 +0200
++++ elasticsearch-elasticsearch-1c16e45/build.gradle	2011-10-13 09:00:27.000000000 +0200
+@@ -11,7 +11,7 @@
+ sdf.setTimeZone(TimeZone.getTimeZone("UTC"));
+ buildTimeStr = sdf.format(buildTime)
+ 
+-versionNumber = '0.17.7'
++versionNumber = '0.17.7-grouping'
+ 
+ explodedDistDir = new File(distsDir, 'exploded')
+ explodedDistLibDir = new File(explodedDistDir, 'lib')
+diff -Nur elasticsearch-elasticsearch-1c16e45.orig/modules/elasticsearch/build.gradle elasticsearch-elasticsearch-1c16e45/modules/elasticsearch/build.gradle
+--- elasticsearch-elasticsearch-1c16e45.orig/modules/elasticsearch/build.gradle	2011-09-19 08:06:18.000000000 +0200
++++ elasticsearch-elasticsearch-1c16e45/modules/elasticsearch/build.gradle	2011-10-13 09:00:04.000000000 +0200
+@@ -43,6 +43,7 @@
+     compile('org.apache.lucene:lucene-queries:3.4.0') { transitive = false }
+     compile('org.apache.lucene:lucene-memory:3.4.0') { transitive = false }
+     compile('org.apache.lucene:lucene-highlighter:3.4.0') { transitive = false }
++    compile('org.apache.lucene:lucene-grouping:3.4.0') { transitive = false }
+ }
+ 
+ configurations {
+diff -Nur elasticsearch-elasticsearch-1c16e45.orig/modules/elasticsearch/src/main/java/org/apache/lucene/search/grouping/AbstractAllGroupHeadsCollector.java elasticsearch-elasticsearch-1c16e45/modules/elasticsearch/src/main/java/org/apache/lucene/search/grouping/AbstractAllGroupHeadsCollector.java
+--- elasticsearch-elasticsearch-1c16e45.orig/modules/elasticsearch/src/main/java/org/apache/lucene/search/grouping/AbstractAllGroupHeadsCollector.java	1970-01-01 01:00:00.000000000 +0100
++++ elasticsearch-elasticsearch-1c16e45/modules/elasticsearch/src/main/java/org/apache/lucene/search/grouping/AbstractAllGroupHeadsCollector.java	2011-10-13 08:59:48.000000000 +0200
+@@ -0,0 +1,179 @@
++package org.apache.lucene.search.grouping;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import org.apache.lucene.index.IndexReader;
++import org.apache.lucene.search.Collector;
++import org.apache.lucene.util.OpenBitSet;
++
++import java.io.IOException;
++import java.util.Collection;
++
++/**
++ * This collector specializes in collecting the most relevant document (group head) for each group that match the query.
++ *
++ * @lucene.experimental
++ */
++public abstract class AbstractAllGroupHeadsCollector<GH extends AbstractAllGroupHeadsCollector.GroupHead> extends Collector {
++
++  protected final int[] reversed;
++  protected final int compIDXEnd;
++  protected final TemporalResult temporalResult;
++
++  protected AbstractAllGroupHeadsCollector(int numberOfSorts) {
++    this.reversed = new int[numberOfSorts];
++    this.compIDXEnd = numberOfSorts - 1;
++    temporalResult = new TemporalResult();
++  }
++
++  /**
++   * @param maxDoc The maxDoc of the top level {@link IndexReader}.
++   * @return an {@link OpenBitSet} containing all group heads.
++   */
++  public OpenBitSet retrieveGroupHeads(int maxDoc) {
++    OpenBitSet bitSet = new OpenBitSet(maxDoc);
++
++    Collection<GH> groupHeads = getCollectedGroupHeads();
++    for (GroupHead groupHead : groupHeads) {
++      bitSet.set(groupHead.doc);
++    }
++
++    return bitSet;
++  }
++
++  /**
++   * @return an int array containing all group heads. The size of the array is equal to number of collected unique groups.
++   */
++  public int[] retrieveGroupHeads() {
++    Collection<GH> groupHeads = getCollectedGroupHeads();
++    int[] docHeads = new int[groupHeads.size()];
++
++    int i = 0;
++    for (GroupHead groupHead : groupHeads) {
++      docHeads[i++] = groupHead.doc;
++    }
++
++    return docHeads;
++  }
++
++  /**
++   * @return the number of group heads found for a query.
++   */
++  public int groupHeadsSize() {
++    return getCollectedGroupHeads().size();
++  }
++
++  /**
++   * Returns the group head and puts it into {@link #temporalResult}.
++   * If the group head wasn't encountered before then it will be added to the collected group heads.
++   * <p/>
++   * The {@link TemporalResult#stop} property will be <code>true</code> if the group head wasn't encountered before
++   * otherwise <code>false</code>.
++   *
++   * @param doc The document to retrieve the group head for.
++   * @throws IOException If I/O related errors occur
++   */
++  protected abstract void retrieveGroupHeadAndAddIfNotExist(int doc) throws IOException;
++
++  /**
++   * Returns the collected group heads.
++   * Subsequent calls should return the same group heads.
++   *
++   * @return the collected group heads
++   */
++  protected abstract Collection<GH> getCollectedGroupHeads();
++
++  public void collect(int doc) throws IOException {
++    retrieveGroupHeadAndAddIfNotExist(doc);
++    if (temporalResult.stop) {
++      return;
++    }
++    GH groupHead = temporalResult.groupHead;
++
++    // Ok now we need to check if the current doc is more relevant then current doc for this group
++    for (int compIDX = 0; ; compIDX++) {
++      final int c = reversed[compIDX] * groupHead.compare(compIDX, doc);
++      if (c < 0) {
++        // Definitely not competitive. So don't even bother to continue
++        return;
++      } else if (c > 0) {
++        // Definitely competitive.
++        break;
++      } else if (compIDX == compIDXEnd) {
++        // Here c=0. If we're at the last comparator, this doc is not
++        // competitive, since docs are visited in doc Id order, which means
++        // this doc cannot compete with any other document in the queue.
++        return;
++      }
++    }
++    groupHead.updateDocHead(doc);
++  }
++
++  public boolean acceptsDocsOutOfOrder() {
++    return true;
++  }
++
++  /**
++   * Contains the result of group head retrieval.
++   * To prevent new object creations of this class for every collect.
++   */
++  protected class TemporalResult {
++
++    public GH groupHead;
++    public boolean stop;
++
++  }
++
++  /**
++   * Represents a group head. A group head is the most relevant document for a particular group.
++   * The relevancy is based is usually based on the sort.
++   *
++   * The group head contains a group value with its associated most relevant document id.
++   */
++  public static abstract class GroupHead<GROUP_VALUE_TYPE> {
++
++    public final GROUP_VALUE_TYPE groupValue;
++    public int doc;
++
++    protected GroupHead(GROUP_VALUE_TYPE groupValue, int doc) {
++      this.groupValue = groupValue;
++      this.doc = doc;
++    }
++
++    /**
++     * Compares the specified document for a specified comparator against the current most relevant document.
++     *
++     * @param compIDX The comparator index of the specified comparator.
++     * @param doc The specified document.
++     * @return -1 if the specified document wasn't competitive against the current most relevant document, 1 if the
++     *         specified document was competitive against the current most relevant document. Otherwise 0.
++     * @throws IOException If I/O related errors occur
++     */
++    protected abstract int compare(int compIDX, int doc) throws IOException;
++
++    /**
++     * Updates the current most relevant document with the specified document.
++     *
++     * @param doc The specified document
++     * @throws IOException If I/O related errors occur
++     */
++    protected abstract void updateDocHead(int doc) throws IOException;
++
++  }
++
++}
+diff -Nur elasticsearch-elasticsearch-1c16e45.orig/modules/elasticsearch/src/main/java/org/apache/lucene/search/grouping/TermAllGroupHeadsCollector.java elasticsearch-elasticsearch-1c16e45/modules/elasticsearch/src/main/java/org/apache/lucene/search/grouping/TermAllGroupHeadsCollector.java
+--- elasticsearch-elasticsearch-1c16e45.orig/modules/elasticsearch/src/main/java/org/apache/lucene/search/grouping/TermAllGroupHeadsCollector.java	1970-01-01 01:00:00.000000000 +0100
++++ elasticsearch-elasticsearch-1c16e45/modules/elasticsearch/src/main/java/org/apache/lucene/search/grouping/TermAllGroupHeadsCollector.java	2011-10-13 08:59:48.000000000 +0200
+@@ -0,0 +1,563 @@
++package org.apache.lucene.search.grouping;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import org.apache.lucene.index.IndexReader;
++import org.apache.lucene.search.*;
++
++import java.io.IOException;
++import java.util.*;
++
++/**
++ * A base implementation of {@link AbstractAllGroupHeadsCollector} for retrieving the most relevant groups when grouping
++ * on a string based group field. More specifically this all concrete implementations of this base implementation
++ * use {@link org.apache.lucene.search.FieldCache.StringIndex}.
++ *
++ * @lucene.experimental
++ */
++public abstract class TermAllGroupHeadsCollector<GH extends AbstractAllGroupHeadsCollector.GroupHead> extends AbstractAllGroupHeadsCollector<GH> {
++
++  private static final int DEFAULT_INITIAL_SIZE = 128;
++
++  final String groupField;
++  FieldCache.StringIndex groupIndex;
++  IndexReader indexReader;
++  int docBase;
++
++  protected TermAllGroupHeadsCollector(String groupField, int numberOfSorts) {
++    super(numberOfSorts);
++    this.groupField = groupField;
++  }
++
++  /**
++   * Creates an <code>AbstractAllGroupHeadsCollector</code> instance based on the supplied arguments.
++   * This factory method decides with implementation is best suited.
++   *
++   * Delegates to {@link #create(String, org.apache.lucene.search.Sort, int)} with an initialSize of 128.
++   *
++   * @param groupField      The field to group by
++   * @param sortWithinGroup The sort within each group
++   * @return an <code>AbstractAllGroupHeadsCollector</code> instance based on the supplied arguments
++   * @throws IOException If I/O related errors occur
++   */
++  public static AbstractAllGroupHeadsCollector create(String groupField, Sort sortWithinGroup) throws IOException {
++    return create(groupField, sortWithinGroup, DEFAULT_INITIAL_SIZE);
++  }
++
++  /**
++   * Creates an <code>AbstractAllGroupHeadsCollector</code> instance based on the supplied arguments.
++   * This factory method decides with implementation is best suited.
++   *
++   * @param groupField      The field to group by
++   * @param sortWithinGroup The sort within each group
++   * @param initialSize The initial allocation size of the internal int set and group list which should roughly match
++   *                    the total number of expected unique groups. Be aware that the heap usage is
++   *                    4 bytes * initialSize.
++   * @return an <code>AbstractAllGroupHeadsCollector</code> instance based on the supplied arguments
++   * @throws IOException If I/O related errors occur
++   */
++  public static AbstractAllGroupHeadsCollector create(String groupField, Sort sortWithinGroup, int initialSize) throws IOException {
++    boolean sortAllScore = true;
++    boolean sortAllFieldValue = true;
++
++    for (SortField sortField : sortWithinGroup.getSort()) {
++      if (sortField.getType() == SortField.SCORE) {
++        sortAllFieldValue = false;
++      } else if (needGeneralImpl(sortField)) {
++        return new GeneralAllGroupHeadsCollector(groupField, sortWithinGroup);
++      } else {
++        sortAllScore = false;
++      }
++    }
++
++    if (sortAllScore) {
++      return new ScoreAllGroupHeadsCollector(groupField, sortWithinGroup, initialSize);
++    } else if (sortAllFieldValue) {
++      return new OrdAllGroupHeadsCollector(groupField, sortWithinGroup, initialSize);
++    } else {
++      return new OrdScoreAllGroupHeadsCollector(groupField, sortWithinGroup, initialSize);
++    }
++  }
++
++  // Returns when a sort field needs the general impl.
++  private static boolean needGeneralImpl(SortField sortField) {
++    int sortType = sortField.getType();
++    // Note (MvG): We can also make an optimized impl when sorting is SortField.DOC
++    return sortType != SortField.STRING_VAL && sortType != SortField.STRING && sortType != SortField.SCORE;
++  }
++
++  // A general impl that works for any group sort.
++  static class GeneralAllGroupHeadsCollector extends TermAllGroupHeadsCollector<GeneralAllGroupHeadsCollector.GroupHead> {
++
++    private final Sort sortWithinGroup;
++    private final Map<String, GroupHead> groups;
++
++    private Scorer scorer;
++
++    GeneralAllGroupHeadsCollector(String groupField, Sort sortWithinGroup) throws IOException {
++      super(groupField, sortWithinGroup.getSort().length);
++      this.sortWithinGroup = sortWithinGroup;
++      groups = new HashMap<String, GroupHead>();
++
++      final SortField[] sortFields = sortWithinGroup.getSort();
++      for (int i = 0; i < sortFields.length; i++) {
++        reversed[i] = sortFields[i].getReverse() ? -1 : 1;
++      }
++    }
++
++    protected void retrieveGroupHeadAndAddIfNotExist(int doc) throws IOException {
++      final int ord = groupIndex.order[doc];
++      final String groupValue = ord == 0 ? null : groupIndex.lookup[ord];
++      GroupHead groupHead = groups.get(groupValue);
++      if (groupHead == null) {
++        groupHead = new GroupHead(groupValue, sortWithinGroup, doc);
++        groups.put(groupValue == null ? null : groupValue, groupHead);
++        temporalResult.stop = true;
++      } else {
++        temporalResult.stop = false;
++      }
++      temporalResult.groupHead = groupHead;
++    }
++
++    protected Collection<GroupHead> getCollectedGroupHeads() {
++      return groups.values();
++    }
++
++    public void setNextReader(IndexReader reader, int docBase) throws IOException {
++      this.indexReader = reader;
++      this.docBase = docBase;
++      groupIndex = FieldCache.DEFAULT.getStringIndex(reader, groupField);
++
++      for (GroupHead groupHead : groups.values()) {
++        for (int i = 0; i < groupHead.comparators.length; i++) {
++          groupHead.comparators[i].setNextReader(reader, docBase);
++        }
++      }
++    }
++
++    public void setScorer(Scorer scorer) throws IOException {
++      this.scorer = scorer;
++      for (GroupHead groupHead : groups.values()) {
++        for (FieldComparator comparator : groupHead.comparators) {
++          comparator.setScorer(scorer);
++        }
++      }
++    }
++
++    class GroupHead extends AbstractAllGroupHeadsCollector.GroupHead<String> {
++
++      final FieldComparator[] comparators;
++
++      private GroupHead(String groupValue, Sort sort, int doc) throws IOException {
++        super(groupValue, doc + docBase);
++        final SortField[] sortFields = sort.getSort();
++        comparators = new FieldComparator[sortFields.length];
++        for (int i = 0; i < sortFields.length; i++) {
++          comparators[i] = sortFields[i].getComparator(1, i);
++          comparators[i].setNextReader(indexReader, docBase);
++          comparators[i].setScorer(scorer);
++          comparators[i].copy(0, doc);
++          comparators[i].setBottom(0);
++        }
++      }
++
++      public int compare(int compIDX, int doc) throws IOException {
++        return comparators[compIDX].compareBottom(doc);
++      }
++
++      public void updateDocHead(int doc) throws IOException {
++        for (FieldComparator comparator : comparators) {
++          comparator.copy(0, doc);
++          comparator.setBottom(0);
++        }
++        this.doc = doc + docBase;
++      }
++    }
++  }
++
++
++  // AbstractAllGroupHeadsCollector optimized for ord fields and scores.
++  static class OrdScoreAllGroupHeadsCollector extends TermAllGroupHeadsCollector<OrdScoreAllGroupHeadsCollector.GroupHead> {
++
++    private final SentinelIntSet ordSet;
++    private final List<GroupHead> collectedGroups;
++    private final SortField[] fields;
++
++    private FieldCache.StringIndex[] sortsIndex;
++    private Scorer scorer;
++    private GroupHead[] segmentGroupHeads;
++
++    OrdScoreAllGroupHeadsCollector(String groupField, Sort sortWithinGroup, int initialSize) {
++      super(groupField, sortWithinGroup.getSort().length);
++      ordSet = new SentinelIntSet(initialSize, -1);
++      collectedGroups = new ArrayList<GroupHead>(initialSize);
++
++      final SortField[] sortFields = sortWithinGroup.getSort();
++      fields = new SortField[sortFields.length];
++      sortsIndex = new FieldCache.StringIndex[sortFields.length];
++      for (int i = 0; i < sortFields.length; i++) {
++        reversed[i] = sortFields[i].getReverse() ? -1 : 1;
++        fields[i] = sortFields[i];
++      }
++    }
++
++    protected Collection<GroupHead> getCollectedGroupHeads() {
++      return collectedGroups;
++    }
++
++    public void setScorer(Scorer scorer) throws IOException {
++      this.scorer = scorer;
++    }
++
++    protected void retrieveGroupHeadAndAddIfNotExist(int doc) throws IOException {
++      int key = groupIndex.order[doc];
++      GroupHead groupHead;
++      if (!ordSet.exists(key)) {
++        ordSet.put(key);
++        String term = key == 0 ? null : groupIndex.lookup[key];
++        groupHead = new GroupHead(doc, term);
++        collectedGroups.add(groupHead);
++        segmentGroupHeads[key] = groupHead;
++        temporalResult.stop = true;
++      } else {
++        temporalResult.stop = false;
++        groupHead = segmentGroupHeads[key];
++      }
++      temporalResult.groupHead = groupHead;
++    }
++
++    public void setNextReader(IndexReader reader, int docBase) throws IOException {
++      this.indexReader = reader;
++      this.docBase = docBase;
++      groupIndex = FieldCache.DEFAULT.getStringIndex(reader, groupField);
++      for (int i = 0; i < fields.length; i++) {
++        if (fields[i].getType() == SortField.SCORE) {
++          continue;
++        }
++
++        sortsIndex[i] = FieldCache.DEFAULT.getStringIndex(reader, fields[i].getField());
++      }
++
++      // Clear ordSet and fill it with previous encountered groups that can occur in the current segment.
++      ordSet.clear();
++      segmentGroupHeads = new GroupHead[groupIndex.lookup.length];
++      for (GroupHead collectedGroup : collectedGroups) {
++        int ord = groupIndex.binarySearchLookup(collectedGroup.groupValue);
++        if (ord >= 0) {
++          ordSet.put(ord);
++          segmentGroupHeads[ord] = collectedGroup;
++
++          for (int i = 0; i < sortsIndex.length; i++) {
++            if (fields[i].getType() == SortField.SCORE) {
++              continue;
++            }
++
++            collectedGroup.sortOrds[i] = sortsIndex[i].binarySearchLookup(collectedGroup.sortValues[i]);
++          }
++        }
++      }
++    }
++
++    class GroupHead extends AbstractAllGroupHeadsCollector.GroupHead<String> {
++
++      String[] sortValues;
++      int[] sortOrds;
++      float[] scores;
++
++      private GroupHead(int doc, String groupValue) throws IOException {
++        super(groupValue, doc + docBase);
++        sortValues = new String[sortsIndex.length];
++        sortOrds = new int[sortsIndex.length];
++        scores = new float[sortsIndex.length];
++        for (int i = 0; i < sortsIndex.length; i++) {
++          if (fields[i].getType() == SortField.SCORE) {
++            scores[i] = scorer.score();
++          } else {
++            sortValues[i] = sortsIndex[i].lookup[sortsIndex[i].order[doc]];
++            sortOrds[i] = sortsIndex[i].order[doc];
++          }
++        }
++
++      }
++
++      public int compare(int compIDX, int doc) throws IOException {
++        if (fields[compIDX].getType() == SortField.SCORE) {
++          float score = scorer.score();
++          if (scores[compIDX] < score) {
++            return 1;
++          } else if (scores[compIDX] > score) {
++            return -1;
++          }
++          return 0;
++        } else {
++          if (sortOrds[compIDX] < 0) {
++            // The current segment doesn't contain the sort value we encountered before. Therefore the ord is negative.
++            final String val1 = sortValues[compIDX];
++            final String val2 = sortsIndex[compIDX].lookup[sortsIndex[compIDX].order[doc]];
++            if (val1 == null) {
++              if (val2 == null) {
++                return 0;
++              }
++              return -1;
++            } else if (val2 == null) {
++              return 1;
++            }
++            return val1.compareTo(val2);
++          } else {
++            return sortOrds[compIDX] - sortsIndex[compIDX].order[doc];
++          }
++        }
++      }
++
++      public void updateDocHead(int doc) throws IOException {
++        for (int i = 0; i < sortsIndex.length; i++) {
++          if (fields[i].getType() == SortField.SCORE) {
++            scores[i] = scorer.score();
++          } else {
++            sortValues[i] = sortsIndex[i].lookup[sortsIndex[i].order[doc]];
++            sortOrds[i] = sortsIndex[i].order[doc];
++          }
++        }
++        this.doc = doc + docBase;
++      }
++
++    }
++
++  }
++
++
++  // AbstractAllGroupHeadsCollector optimized for ord fields.
++  static class OrdAllGroupHeadsCollector extends TermAllGroupHeadsCollector<OrdAllGroupHeadsCollector.GroupHead> {
++
++    private final SentinelIntSet ordSet;
++    private final List<GroupHead> collectedGroups;
++    private final SortField[] fields;
++
++    private FieldCache.StringIndex[] sortsIndex;
++    private GroupHead[] segmentGroupHeads;
++
++    OrdAllGroupHeadsCollector(String groupField, Sort sortWithinGroup, int initialSize) {
++      super(groupField, sortWithinGroup.getSort().length);
++      ordSet = new SentinelIntSet(initialSize, -1);
++      collectedGroups = new ArrayList<GroupHead>(initialSize);
++
++      final SortField[] sortFields = sortWithinGroup.getSort();
++      fields = new SortField[sortFields.length];
++      sortsIndex = new FieldCache.StringIndex[sortFields.length];
++      for (int i = 0; i < sortFields.length; i++) {
++        reversed[i] = sortFields[i].getReverse() ? -1 : 1;
++        fields[i] = sortFields[i];
++      }
++    }
++
++    protected Collection<GroupHead> getCollectedGroupHeads() {
++      return collectedGroups;
++    }
++
++    public void setScorer(Scorer scorer) throws IOException {
++    }
++
++    protected void retrieveGroupHeadAndAddIfNotExist(int doc) throws IOException {
++      int key = groupIndex.order[doc];
++      GroupHead groupHead;
++      if (!ordSet.exists(key)) {
++        ordSet.put(key);
++        String term = key == 0 ? null : groupIndex.lookup[key];
++        groupHead = new GroupHead(doc, term);
++        collectedGroups.add(groupHead);
++        segmentGroupHeads[key] = groupHead;
++        temporalResult.stop = true;
++      } else {
++        temporalResult.stop = false;
++        groupHead = segmentGroupHeads[key];
++      }
++      temporalResult.groupHead = groupHead;
++    }
++
++    public void setNextReader(IndexReader reader, int docBase) throws IOException {
++      this.indexReader = reader;
++      this.docBase = docBase;
++      groupIndex = FieldCache.DEFAULT.getStringIndex(reader, groupField);
++      for (int i = 0; i < fields.length; i++) {
++        sortsIndex[i] = FieldCache.DEFAULT.getStringIndex(reader, fields[i].getField());
++      }
++
++      // Clear ordSet and fill it with previous encountered groups that can occur in the current segment.
++      ordSet.clear();
++      segmentGroupHeads = new GroupHead[groupIndex.lookup.length];
++      for (GroupHead collectedGroup : collectedGroups) {
++        int groupOrd = groupIndex.binarySearchLookup(collectedGroup.groupValue);
++        if (groupOrd >= 0) {
++          ordSet.put(groupOrd);
++          segmentGroupHeads[groupOrd] = collectedGroup;
++
++          for (int i = 0; i < sortsIndex.length; i++) {
++            collectedGroup.sortOrds[i] = sortsIndex[i].binarySearchLookup(collectedGroup.sortValues[i]);
++          }
++        }
++      }
++    }
++
++    class GroupHead extends AbstractAllGroupHeadsCollector.GroupHead<String> {
++
++      String[] sortValues;
++      int[] sortOrds;
++
++      private GroupHead(int doc, String groupValue) throws IOException {
++        super(groupValue, doc + docBase);
++        sortValues = new String[sortsIndex.length];
++        sortOrds = new int[sortsIndex.length];
++        for (int i = 0; i < sortsIndex.length; i++) {
++          sortValues[i] = sortsIndex[i].lookup[sortsIndex[i].order[doc]];
++          sortOrds[i] = sortsIndex[i].order[doc];
++        }
++      }
++
++      public int compare(int compIDX, int doc) throws IOException {
++        if (sortOrds[compIDX] < 0) {
++          // The current segment doesn't contain the sort value we encountered before. Therefore the ord is negative.
++          final String val1 = sortValues[compIDX];
++          final String val2 = sortsIndex[compIDX].lookup[sortsIndex[compIDX].order[doc]];
++          if (val1 == null) {
++            if (val2 == null) {
++              return 0;
++            }
++            return -1;
++          } else if (val2 == null) {
++            return 1;
++          }
++          return val1.compareTo(val2);
++        } else {
++          return sortOrds[compIDX] - sortsIndex[compIDX].order[doc];
++        }
++      }
++
++      public void updateDocHead(int doc) throws IOException {
++        for (int i = 0; i < sortsIndex.length; i++) {
++          sortValues[i] = sortsIndex[i].lookup[sortsIndex[i].order[doc]];
++          sortOrds[i] = sortsIndex[i].order[doc];
++        }
++        this.doc = doc + docBase;
++      }
++
++    }
++
++  }
++
++
++  // AbstractAllGroupHeadsCollector optimized for scores.
++  static class ScoreAllGroupHeadsCollector extends TermAllGroupHeadsCollector<ScoreAllGroupHeadsCollector.GroupHead> {
++
++    private final SentinelIntSet ordSet;
++    private final List<GroupHead> collectedGroups;
++    private final SortField[] fields;
++
++    private Scorer scorer;
++    private GroupHead[] segmentGroupHeads;
++
++    ScoreAllGroupHeadsCollector(String groupField, Sort sortWithinGroup, int initialSize) {
++      super(groupField, sortWithinGroup.getSort().length);
++      ordSet = new SentinelIntSet(initialSize, -1);
++      collectedGroups = new ArrayList<GroupHead>(initialSize);
++
++      final SortField[] sortFields = sortWithinGroup.getSort();
++      fields = new SortField[sortFields.length];
++      for (int i = 0; i < sortFields.length; i++) {
++        reversed[i] = sortFields[i].getReverse() ? -1 : 1;
++        fields[i] = sortFields[i];
++      }
++    }
++
++    protected Collection<GroupHead> getCollectedGroupHeads() {
++      return collectedGroups;
++    }
++
++    public void setScorer(Scorer scorer) throws IOException {
++      this.scorer = scorer;
++    }
++
++    protected void retrieveGroupHeadAndAddIfNotExist(int doc) throws IOException {
++      int key = groupIndex.order[doc];
++      GroupHead groupHead;
++      if (!ordSet.exists(key)) {
++        ordSet.put(key);
++        String term = key == 0 ? null : groupIndex.lookup[key];
++        groupHead = new GroupHead(doc, term);
++        collectedGroups.add(groupHead);
++        segmentGroupHeads[key] = groupHead;
++        temporalResult.stop = true;
++      } else {
++        temporalResult.stop = false;
++        groupHead = segmentGroupHeads[key];
++      }
++      temporalResult.groupHead = groupHead;
++    }
++
++    public void setNextReader(IndexReader reader, int docBase) throws IOException {
++      this.indexReader = reader;
++      this.docBase = docBase;
++      groupIndex = FieldCache.DEFAULT.getStringIndex(reader, groupField);
++
++      // Clear ordSet and fill it with previous encountered groups that can occur in the current segment.
++      ordSet.clear();
++      segmentGroupHeads = new GroupHead[groupIndex.lookup.length];
++      for (GroupHead collectedGroup : collectedGroups) {
++        int ord = groupIndex.binarySearchLookup(collectedGroup.groupValue);
++        if (ord >= 0) {
++          ordSet.put(ord);
++          segmentGroupHeads[ord] = collectedGroup;
++        }
++      }
++    }
++
++    class GroupHead extends AbstractAllGroupHeadsCollector.GroupHead<String> {
++
++      float[] scores;
++
++      private GroupHead(int doc, String groupValue) throws IOException {
++        super(groupValue, doc + docBase);
++        scores = new float[fields.length];
++        float score = scorer.score();
++        for (int i = 0; i < scores.length; i++) {
++          scores[i] = score;
++        }
++      }
++
++      public int compare(int compIDX, int doc) throws IOException {
++        float score = scorer.score();
++        if (scores[compIDX] < score) {
++          return 1;
++        } else if (scores[compIDX] > score) {
++          return -1;
++        }
++        return 0;
++      }
++
++      public void updateDocHead(int doc) throws IOException {
++        float score = scorer.score();
++        for (int i = 0; i < scores.length; i++) {
++          scores[i] = score;
++        }
++        this.doc = doc + docBase;
++      }
++
++    }
++
++  }
++
++}
+diff -Nur elasticsearch-elasticsearch-1c16e45.orig/modules/elasticsearch/src/main/java/org/elasticsearch/action/search/SearchType.java elasticsearch-elasticsearch-1c16e45/modules/elasticsearch/src/main/java/org/elasticsearch/action/search/SearchType.java
+--- elasticsearch-elasticsearch-1c16e45.orig/modules/elasticsearch/src/main/java/org/elasticsearch/action/search/SearchType.java	2011-09-19 08:06:18.000000000 +0200
++++ elasticsearch-elasticsearch-1c16e45/modules/elasticsearch/src/main/java/org/elasticsearch/action/search/SearchType.java	2011-10-13 08:59:48.000000000 +0200
+@@ -58,7 +58,9 @@
+     /**
+      * Only counts the results, will still execute facets and the like.
+      */
+-    COUNT((byte) 5);
++    COUNT((byte) 5),
++
++    GROUP_THEN_FETCH((byte) 6);
+ 
+     /**
+      * The default search type ({@link #QUERY_THEN_FETCH}.
+@@ -120,6 +122,8 @@
+             return SearchType.SCAN;
+         } else if ("count".equals(searchType)) {
+             return SearchType.COUNT;
++        } else if ("group".equals(searchType)) {
++            return SearchType.GROUP_THEN_FETCH;
+         } else {
+             throw new ElasticSearchIllegalArgumentException("No search type for [" + searchType + "]");
+         }
+diff -Nur elasticsearch-elasticsearch-1c16e45.orig/modules/elasticsearch/src/main/java/org/elasticsearch/action/search/TransportSearchAction.java elasticsearch-elasticsearch-1c16e45/modules/elasticsearch/src/main/java/org/elasticsearch/action/search/TransportSearchAction.java
+--- elasticsearch-elasticsearch-1c16e45.orig/modules/elasticsearch/src/main/java/org/elasticsearch/action/search/TransportSearchAction.java	2011-09-19 08:06:18.000000000 +0200
++++ elasticsearch-elasticsearch-1c16e45/modules/elasticsearch/src/main/java/org/elasticsearch/action/search/TransportSearchAction.java	2011-10-13 08:59:48.000000000 +0200
+@@ -94,7 +94,7 @@
+                 String[] concreteIndices = clusterState.metaData().concreteIndices(searchRequest.indices(), false, true);
+                 Map<String, Set<String>> routingMap = clusterState.metaData().resolveSearchRouting(searchRequest.routing(), searchRequest.indices());
+                 int shardCount = clusterService.operationRouting().searchShardsCount(clusterState, searchRequest.indices(), concreteIndices, searchRequest.queryHint(), routingMap, searchRequest.preference());
+-                if (shardCount == 1) {
++                if (shardCount == 1 && searchRequest.searchType() != GROUP_THEN_FETCH) {
+                     // if we only have one group, then we always want Q_A_F, no need for DFS, and no need to do THEN since we hit one shard
+                     searchRequest.searchType(QUERY_AND_FETCH);
+                 }
+@@ -112,7 +112,7 @@
+             queryThenFetchAction.execute(searchRequest, listener);
+         } else if (searchRequest.searchType() == SearchType.DFS_QUERY_AND_FETCH) {
+             dfsQueryAndFetchAction.execute(searchRequest, listener);
+-        } else if (searchRequest.searchType() == SearchType.QUERY_AND_FETCH) {
++        } else if (searchRequest.searchType() == SearchType.QUERY_AND_FETCH || searchRequest.searchType() == SearchType.GROUP_THEN_FETCH) {
+             queryAndFetchAction.execute(searchRequest, listener);
+         } else if (searchRequest.searchType() == SearchType.SCAN) {
+             scanAction.execute(searchRequest, listener);
+diff -Nur elasticsearch-elasticsearch-1c16e45.orig/modules/elasticsearch/src/main/java/org/elasticsearch/client/action/search/SearchRequestBuilder.java elasticsearch-elasticsearch-1c16e45/modules/elasticsearch/src/main/java/org/elasticsearch/client/action/search/SearchRequestBuilder.java
+--- elasticsearch-elasticsearch-1c16e45.orig/modules/elasticsearch/src/main/java/org/elasticsearch/client/action/search/SearchRequestBuilder.java	2011-09-19 08:06:18.000000000 +0200
++++ elasticsearch-elasticsearch-1c16e45/modules/elasticsearch/src/main/java/org/elasticsearch/client/action/search/SearchRequestBuilder.java	2011-10-13 08:59:48.000000000 +0200
+@@ -380,6 +380,14 @@
+     }
+ 
+     /**
++     * Enables grouping and specifies on what field to group. By default no grouping occurs.
++     */
++    public SearchRequestBuilder setGroupField(String groupField) {
++        sourceBuilder().groupField(groupField);
++        return this;
++    }
++
++    /**
+      * Adds the fields to load and return as part of the search request. If none are specified,
+      * the source of the document will be returned.
+      */
+diff -Nur elasticsearch-elasticsearch-1c16e45.orig/modules/elasticsearch/src/main/java/org/elasticsearch/rest/action/search/RestSearchAction.java elasticsearch-elasticsearch-1c16e45/modules/elasticsearch/src/main/java/org/elasticsearch/rest/action/search/RestSearchAction.java
+--- elasticsearch-elasticsearch-1c16e45.orig/modules/elasticsearch/src/main/java/org/elasticsearch/rest/action/search/RestSearchAction.java	2011-09-19 08:06:18.000000000 +0200
++++ elasticsearch-elasticsearch-1c16e45/modules/elasticsearch/src/main/java/org/elasticsearch/rest/action/search/RestSearchAction.java	2011-10-13 08:59:48.000000000 +0200
+@@ -177,6 +177,10 @@
+             searchSourceBuilder.size(size);
+         }
+ 
++        String groupField = request.param("group_field");
++        if (groupField != null) {
++            searchSourceBuilder.groupField(groupField);
++        }
+ 
+         searchSourceBuilder.explain(request.paramAsBoolean("explain", null));
+         searchSourceBuilder.version(request.paramAsBoolean("version", null));
+diff -Nur elasticsearch-elasticsearch-1c16e45.orig/modules/elasticsearch/src/main/java/org/elasticsearch/search/SearchHit.java elasticsearch-elasticsearch-1c16e45/modules/elasticsearch/src/main/java/org/elasticsearch/search/SearchHit.java
+--- elasticsearch-elasticsearch-1c16e45.orig/modules/elasticsearch/src/main/java/org/elasticsearch/search/SearchHit.java	2011-09-19 08:06:18.000000000 +0200
++++ elasticsearch-elasticsearch-1c16e45/modules/elasticsearch/src/main/java/org/elasticsearch/search/SearchHit.java	2011-10-13 08:59:48.000000000 +0200
+@@ -96,6 +96,11 @@
+     boolean isSourceEmpty();
+ 
+     /**
++     * Is this document grouped or not.
++     */
++    boolean isGrouped();
++
++    /**
+      * The source of the document as a map (can be <tt>null</tt>).
+      */
+     Map<String, Object> getSource();
+diff -Nur elasticsearch-elasticsearch-1c16e45.orig/modules/elasticsearch/src/main/java/org/elasticsearch/search/builder/SearchSourceBuilder.java elasticsearch-elasticsearch-1c16e45/modules/elasticsearch/src/main/java/org/elasticsearch/search/builder/SearchSourceBuilder.java
+--- elasticsearch-elasticsearch-1c16e45.orig/modules/elasticsearch/src/main/java/org/elasticsearch/search/builder/SearchSourceBuilder.java	2011-09-19 08:06:18.000000000 +0200
++++ elasticsearch-elasticsearch-1c16e45/modules/elasticsearch/src/main/java/org/elasticsearch/search/builder/SearchSourceBuilder.java	2011-10-13 08:59:48.000000000 +0200
+@@ -100,6 +100,7 @@
+ 
+     private TObjectFloatHashMap<String> indexBoost = null;
+ 
++    private String groupField;
+ 
+     /**
+      * Constructs a new search source builder.
+@@ -292,6 +293,11 @@
+         return this;
+     }
+ 
++    public SearchSourceBuilder groupField(String groupField) {
++        this.groupField = groupField;
++        return this;
++    }
++
+     /**
+      * Adds the fields to load and return as part of the search request. If none are specified,
+      * the source of the document will be returned.
+@@ -465,6 +471,10 @@
+             }
+         }
+ 
++        if (groupField != null) {
++            builder.field("groupField", groupField);
++        }
++
+         if (scriptFields != null) {
+             builder.startObject("script_fields");
+             for (ScriptField scriptField : scriptFields) {
+diff -Nur elasticsearch-elasticsearch-1c16e45.orig/modules/elasticsearch/src/main/java/org/elasticsearch/search/facet/AbstractFacetCollector.java elasticsearch-elasticsearch-1c16e45/modules/elasticsearch/src/main/java/org/elasticsearch/search/facet/AbstractFacetCollector.java
+--- elasticsearch-elasticsearch-1c16e45.orig/modules/elasticsearch/src/main/java/org/elasticsearch/search/facet/AbstractFacetCollector.java	2011-09-19 08:06:18.000000000 +0200
++++ elasticsearch-elasticsearch-1c16e45/modules/elasticsearch/src/main/java/org/elasticsearch/search/facet/AbstractFacetCollector.java	2011-10-13 08:59:48.000000000 +0200
+@@ -40,10 +40,20 @@
+ 
+     private DocSet docSet = null;
+ 
++    private boolean grouped = false;
++
+     public AbstractFacetCollector(String facetName) {
+         this.facetName = facetName;
+     }
+ 
++    @Override public boolean grouped() {
++        return grouped;
++    }
++
++    @Override public void grouped(boolean grouped) {
++        this.grouped = grouped;
++    }
++
+     public Filter getFilter() {
+         return this.filter;
+     }
+diff -Nur elasticsearch-elasticsearch-1c16e45.orig/modules/elasticsearch/src/main/java/org/elasticsearch/search/facet/FacetCollector.java elasticsearch-elasticsearch-1c16e45/modules/elasticsearch/src/main/java/org/elasticsearch/search/facet/FacetCollector.java
+--- elasticsearch-elasticsearch-1c16e45.orig/modules/elasticsearch/src/main/java/org/elasticsearch/search/facet/FacetCollector.java	2011-09-19 08:06:18.000000000 +0200
++++ elasticsearch-elasticsearch-1c16e45/modules/elasticsearch/src/main/java/org/elasticsearch/search/facet/FacetCollector.java	2011-10-13 08:59:48.000000000 +0200
+@@ -30,4 +30,11 @@
+     public abstract Facet facet();
+ 
+     public abstract void setFilter(Filter filter);
++
++    public boolean grouped() {
++        return false;
++    }
++
++    public void grouped(boolean grouped) {}
++
+ }
+diff -Nur elasticsearch-elasticsearch-1c16e45.orig/modules/elasticsearch/src/main/java/org/elasticsearch/search/facet/FacetParseElement.java elasticsearch-elasticsearch-1c16e45/modules/elasticsearch/src/main/java/org/elasticsearch/search/facet/FacetParseElement.java
+--- elasticsearch-elasticsearch-1c16e45.orig/modules/elasticsearch/src/main/java/org/elasticsearch/search/facet/FacetParseElement.java	2011-09-19 08:06:18.000000000 +0200
++++ elasticsearch-elasticsearch-1c16e45/modules/elasticsearch/src/main/java/org/elasticsearch/search/facet/FacetParseElement.java	2011-10-13 08:59:48.000000000 +0200
+@@ -77,6 +77,7 @@
+                 Filter filter = null;
+                 boolean cacheFilter = true;
+                 String nestedPath = null;
++                boolean grouped = false;
+                 while ((token = parser.nextToken()) != XContentParser.Token.END_OBJECT) {
+                     if (token == XContentParser.Token.FIELD_NAME) {
+                         facetFieldName = parser.currentName();
+@@ -101,6 +102,8 @@
+                             cacheFilter = parser.booleanValue();
+                         } else if ("nested".equals(facetFieldName)) {
+                             nestedPath = parser.text();
++                        } else if ("grouped".equals(facetFieldName)) {
++                            grouped = parser.booleanValue();
+                         }
+                     }
+                 }
+@@ -131,6 +134,7 @@
+                     throw new SearchParseException(context, "no facet type found for facet named [" + topLevelFieldName + "]");
+                 }
+ 
++                facet.grouped(grouped);
+                 if (facetCollectors == null) {
+                     facetCollectors = Lists.newArrayList();
+                 }
+diff -Nur elasticsearch-elasticsearch-1c16e45.orig/modules/elasticsearch/src/main/java/org/elasticsearch/search/facet/terms/TermsFacetBuilder.java elasticsearch-elasticsearch-1c16e45/modules/elasticsearch/src/main/java/org/elasticsearch/search/facet/terms/TermsFacetBuilder.java
+--- elasticsearch-elasticsearch-1c16e45.orig/modules/elasticsearch/src/main/java/org/elasticsearch/search/facet/terms/TermsFacetBuilder.java	2011-09-19 08:06:18.000000000 +0200
++++ elasticsearch-elasticsearch-1c16e45/modules/elasticsearch/src/main/java/org/elasticsearch/search/facet/terms/TermsFacetBuilder.java	2011-10-13 08:59:48.000000000 +0200
+@@ -47,6 +47,7 @@
+     private String lang;
+     private Map<String, Object> params;
+     String executionHint;
++    private boolean grouped;
+ 
+     /**
+      * Construct a new term facet with the provided facet name.
+@@ -181,6 +182,11 @@
+         return this;
+     }
+ 
++    public TermsFacetBuilder grouped(boolean grouped) {
++        this.grouped = grouped;
++        return this;
++    }
++
+     /**
+      * A parameter that will be passed to the script.
+      *
+@@ -255,7 +261,9 @@
+             builder.field("execution_hint", executionHint);
+         }
+ 
++
+         builder.endObject();
++        builder.field("grouped", grouped);
+ 
+         addFilterFacetAndGlobal(builder, params);
+ 
+diff -Nur elasticsearch-elasticsearch-1c16e45.orig/modules/elasticsearch/src/main/java/org/elasticsearch/search/fetch/FetchPhase.java elasticsearch-elasticsearch-1c16e45/modules/elasticsearch/src/main/java/org/elasticsearch/search/fetch/FetchPhase.java
+--- elasticsearch-elasticsearch-1c16e45.orig/modules/elasticsearch/src/main/java/org/elasticsearch/search/fetch/FetchPhase.java	2011-09-19 08:06:18.000000000 +0200
++++ elasticsearch-elasticsearch-1c16e45/modules/elasticsearch/src/main/java/org/elasticsearch/search/fetch/FetchPhase.java	2011-10-13 08:59:48.000000000 +0200
+@@ -61,6 +61,7 @@
+  */
+ public class FetchPhase implements SearchPhase {
+ 
++    private static final String GROUPED_FIELD = "###grouped###";
+     private final SearchHitPhase[] hitPhases;
+ 
+     @Inject public FetchPhase(HighlightPhase highlightPhase, ScriptFieldsSearchHitPhase scriptFieldsPhase,
+@@ -99,7 +100,8 @@
+ 
+             // get the version
+ 
+-            InternalSearchHit searchHit = new InternalSearchHit(docId, uid.id(), uid.type(), source, null);
++            boolean grouped = context.queryResult().documentGrouped().contains(docId);
++            InternalSearchHit searchHit = new InternalSearchHit(docId, uid.id(), uid.type(), source, null, grouped);
+             hits[index] = searchHit;
+ 
+             for (Object oField : doc.getFields()) {
+@@ -159,6 +161,20 @@
+         context.fetchResult().hits(new InternalSearchHits(hits, context.queryResult().topDocs().totalHits, context.queryResult().topDocs().getMaxScore()));
+     }
+ 
++    private void addGroupInformation(SearchContext context, int docId, InternalSearchHit searchHit) {
++        if (searchHit.fieldsOrNull() == null) {
++            searchHit.fields(new HashMap<String, SearchHitField>(2));
++        }
++        SearchHitField hitField = searchHit.fields().get(GROUPED_FIELD);
++        if (hitField == null) {
++            hitField = new InternalSearchHitField(GROUPED_FIELD, new ArrayList<Object>(2));
++            searchHit.fields().put(GROUPED_FIELD, hitField);
++        }
++
++        boolean grouped = context.queryResult().documentGrouped().contains(docId);
++        hitField.values().add(grouped);
++    }
++
+     private byte[] extractSource(Document doc, DocumentMapper documentMapper) {
+         Fieldable sourceField = doc.getFieldable(SourceFieldMapper.NAME);
+         if (sourceField != null) {
+diff -Nur elasticsearch-elasticsearch-1c16e45.orig/modules/elasticsearch/src/main/java/org/elasticsearch/search/internal/InternalSearchHit.java elasticsearch-elasticsearch-1c16e45/modules/elasticsearch/src/main/java/org/elasticsearch/search/internal/InternalSearchHit.java
+--- elasticsearch-elasticsearch-1c16e45.orig/modules/elasticsearch/src/main/java/org/elasticsearch/search/internal/InternalSearchHit.java	2011-09-19 08:06:18.000000000 +0200
++++ elasticsearch-elasticsearch-1c16e45/modules/elasticsearch/src/main/java/org/elasticsearch/search/internal/InternalSearchHit.java	2011-10-13 08:59:48.000000000 +0200
+@@ -81,16 +81,23 @@
+ 
+     private Map<String, Object> sourceAsMap;
+ 
++    private boolean grouped;
++
+     private InternalSearchHit() {
+ 
+     }
+ 
+-    public InternalSearchHit(int docId, String id, String type, byte[] source, Map<String, SearchHitField> fields) {
++    public InternalSearchHit(int docId, String id, String type, byte[] source, Map<String, SearchHitField> fields, boolean grouped) {
+         this.docId = docId;
+         this.id = id;
+         this.type = type;
+         this.source = source;
+         this.fields = fields;
++        this.grouped = grouped;
++    }
++
++    @Override public boolean isGrouped() {
++        return grouped;
+     }
+ 
+     public int docId() {
+@@ -304,6 +311,7 @@
+         static final XContentBuilderString VALUE = new XContentBuilderString("value");
+         static final XContentBuilderString DESCRIPTION = new XContentBuilderString("description");
+         static final XContentBuilderString DETAILS = new XContentBuilderString("details");
++        static final XContentBuilderString _GROUPED = new XContentBuilderString("_grouped");
+     }
+ 
+     @Override public XContentBuilder toXContent(XContentBuilder builder, Params params) throws IOException {
+@@ -326,6 +334,7 @@
+         if (source != null) {
+             RestXContentBuilder.restDocumentSource(source, builder, params);
+         }
++        builder.field(Fields._GROUPED, grouped);
+         if (fields != null && !fields.isEmpty()) {
+             builder.startObject(Fields.FIELDS);
+             for (SearchHitField field : fields.values()) {
+@@ -413,6 +422,7 @@
+         id = in.readUTF();
+         type = in.readUTF();
+         version = in.readLong();
++        grouped = in.readBoolean();
+         int size = in.readVInt();
+         if (size > 0) {
+             source = new byte[size];
+@@ -546,6 +556,7 @@
+         out.writeUTF(id);
+         out.writeUTF(type);
+         out.writeLong(version);
++        out.writeBoolean(grouped);
+         if (source == null) {
+             out.writeVInt(0);
+         } else {
+diff -Nur elasticsearch-elasticsearch-1c16e45.orig/modules/elasticsearch/src/main/java/org/elasticsearch/search/internal/SearchContext.java elasticsearch-elasticsearch-1c16e45/modules/elasticsearch/src/main/java/org/elasticsearch/search/internal/SearchContext.java
+--- elasticsearch-elasticsearch-1c16e45.orig/modules/elasticsearch/src/main/java/org/elasticsearch/search/internal/SearchContext.java	2011-09-19 08:06:18.000000000 +0200
++++ elasticsearch-elasticsearch-1c16e45/modules/elasticsearch/src/main/java/org/elasticsearch/search/internal/SearchContext.java	2011-10-13 08:59:48.000000000 +0200
+@@ -27,6 +27,8 @@
+ import org.elasticsearch.common.collect.ImmutableList;
+ import org.elasticsearch.common.collect.Lists;
+ import org.elasticsearch.common.lease.Releasable;
++import org.elasticsearch.common.lucene.docset.DocSet;
++import org.elasticsearch.common.lucene.docset.OpenBitDocSet;
+ import org.elasticsearch.common.unit.TimeValue;
+ import org.elasticsearch.index.analysis.AnalysisService;
+ import org.elasticsearch.index.cache.field.data.FieldDataCache;
+@@ -61,6 +63,7 @@
+ public class SearchContext implements Releasable {
+ 
+     private static ThreadLocal<SearchContext> current = new ThreadLocal<SearchContext>();
++    private DocSet groupedDocSet;
+ 
+     public static void setCurrent(SearchContext value) {
+         current.set(value);
+@@ -117,6 +120,8 @@
+ 
+     private Sort sort;
+ 
++    private String groupField;
++
+     private Float minimumScore;
+ 
+     private boolean trackScores = false; // when sorting, track scores as well...
+@@ -321,6 +326,16 @@
+         return this.sort;
+     }
+ 
++    public String groupField() {
++        return groupField;
++    }
++
++    public SearchContext groupField(String groupField) {
++        this.groupField = groupField;
++        this.searchType = SearchType.GROUP_THEN_FETCH;
++        return this;
++    }
++
+     public SearchContext trackScores(boolean trackScores) {
+         this.trackScores = trackScores;
+         return this;
+@@ -506,4 +521,12 @@
+         }
+         nestedQueries.put(scope, query);
+     }
++
++    public void groupedDocSet(DocSet groupedDocSet) {
++        this.groupedDocSet = groupedDocSet;
++    }
++
++    public DocSet groupedDocSet() {
++        return groupedDocSet;
++    }
+ }
+diff -Nur elasticsearch-elasticsearch-1c16e45.orig/modules/elasticsearch/src/main/java/org/elasticsearch/search/query/GroupFieldParseElement.java elasticsearch-elasticsearch-1c16e45/modules/elasticsearch/src/main/java/org/elasticsearch/search/query/GroupFieldParseElement.java
+--- elasticsearch-elasticsearch-1c16e45.orig/modules/elasticsearch/src/main/java/org/elasticsearch/search/query/GroupFieldParseElement.java	1970-01-01 01:00:00.000000000 +0100
++++ elasticsearch-elasticsearch-1c16e45/modules/elasticsearch/src/main/java/org/elasticsearch/search/query/GroupFieldParseElement.java	2011-10-13 08:59:48.000000000 +0200
+@@ -0,0 +1,37 @@
++/*
++ * Licensed to Elastic Search and Shay Banon under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership. Elastic Search licenses this
++ * file to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++
++package org.elasticsearch.search.query;
++
++import org.elasticsearch.common.xcontent.XContentParser;
++import org.elasticsearch.search.SearchParseElement;
++import org.elasticsearch.search.internal.SearchContext;
++
++/**
++ * @author Martijn van Groningen
++ */
++public class GroupFieldParseElement implements SearchParseElement {
++
++    @Override public void parse(XContentParser parser, SearchContext context) throws Exception {
++        XContentParser.Token token = parser.currentToken();
++        if (token.isValue()) {
++            context.groupField(parser.text());
++        }
++    }
++}
+diff -Nur elasticsearch-elasticsearch-1c16e45.orig/modules/elasticsearch/src/main/java/org/elasticsearch/search/query/QueryPhase.java elasticsearch-elasticsearch-1c16e45/modules/elasticsearch/src/main/java/org/elasticsearch/search/query/QueryPhase.java
+--- elasticsearch-elasticsearch-1c16e45.orig/modules/elasticsearch/src/main/java/org/elasticsearch/search/query/QueryPhase.java	2011-09-19 08:06:18.000000000 +0200
++++ elasticsearch-elasticsearch-1c16e45/modules/elasticsearch/src/main/java/org/elasticsearch/search/query/QueryPhase.java	2011-10-13 08:59:48.000000000 +0200
+@@ -19,23 +19,29 @@
+ 
+ package org.elasticsearch.search.query;
+ 
++import org.apache.lucene.index.ExtendedIndexSearcher;
+ import org.apache.lucene.index.IndexReader;
+-import org.apache.lucene.search.Collector;
+-import org.apache.lucene.search.Filter;
+-import org.apache.lucene.search.FilteredQuery;
+-import org.apache.lucene.search.Query;
+-import org.apache.lucene.search.ScoreDoc;
+-import org.apache.lucene.search.Scorer;
+-import org.apache.lucene.search.SortField;
+-import org.apache.lucene.search.TopDocs;
++import org.apache.lucene.search.*;
++import org.apache.lucene.search.grouping.AbstractAllGroupHeadsCollector;
++import org.apache.lucene.search.grouping.SearchGroup;
++import org.apache.lucene.search.grouping.TermAllGroupHeadsCollector;
++import org.apache.lucene.search.grouping.TermAllGroupsCollector;
++import org.apache.lucene.search.grouping.TermFirstPassGroupingCollector;
++import org.apache.lucene.search.grouping.TermSecondPassGroupingCollector;
++import org.apache.lucene.search.grouping.TopGroups;
++import org.apache.lucene.util.ArrayUtil;
++import org.apache.lucene.util.OpenBitSet;
+ import org.elasticsearch.action.search.SearchType;
+ import org.elasticsearch.common.collect.ImmutableMap;
+ import org.elasticsearch.common.inject.Inject;
++import org.elasticsearch.common.lucene.docset.OpenBitDocSet;
+ import org.elasticsearch.common.lucene.search.function.BoostScoreFunction;
+ import org.elasticsearch.common.lucene.search.function.FunctionScoreQuery;
+ import org.elasticsearch.index.query.ParsedQuery;
+ import org.elasticsearch.search.SearchParseElement;
+ import org.elasticsearch.search.SearchPhase;
++import org.elasticsearch.search.facet.AbstractFacetCollector;
++import org.elasticsearch.search.facet.FacetCollector;
+ import org.elasticsearch.search.facet.FacetPhase;
+ import org.elasticsearch.search.internal.ContextIndexSearcher;
+ import org.elasticsearch.search.internal.ScopePhase;
+@@ -45,6 +51,10 @@
+ 
+ import java.io.IOException;
+ import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Collection;
++import java.util.Collections;
++import java.util.List;
+ import java.util.Map;
+ 
+ /**
+@@ -70,6 +80,7 @@
+                 .put("filterBinary", new FilterBinaryParseElement())
+                 .put("filter_binary", new FilterBinaryParseElement())
+                 .put("sort", new SortParseElement())
++                .put("groupField", new GroupFieldParseElement())
+                 .put("trackScores", new TrackScoresParseElement())
+                 .put("track_scores", new TrackScoresParseElement())
+                 .put("min_score", new MinScoreParseElement())
+@@ -211,6 +222,72 @@
+                     // all is well
+                 }
+                 topDocs = scanCollector.topDocs();
++            } else if (searchContext.searchType() == SearchType.GROUP_THEN_FETCH) {
++                boolean groupedFacets = false;
++                List<FacetCollector> facetCollectors;
++                if (searchContext.facets() != null) {
++                    facetCollectors = searchContext.facets().facetCollectors();
++                } else {
++                    facetCollectors = Collections.emptyList();
++                }
++
++                for (FacetCollector facetCollector : facetCollectors) {
++                    if (facetCollector.grouped()) {
++                        groupedFacets = true;
++                        break;
++                    }
++                }
++
++                Sort _sort = sort ? searchContext.sort() : new Sort();
++                // Otherwise we also execute the scoped collectors in ExtendedIndexSearcher. We only need to execute them in the second phase..
++                final ExtendedIndexSearcher searcher = new ExtendedIndexSearcher(searchContext.searcher().getIndexReader());
++
++                // Because filters by default don't effect facets we need to seperately execute a search to get the grouped docset without filters
++                // So we seperate the the getting grouped docset from the main search...
++                if (groupedFacets) {
++                    AbstractAllGroupHeadsCollector termAllGroupHeadsCollector = TermAllGroupHeadsCollector.create(searchContext.groupField(), _sort);
++                    searcher.search(query, termAllGroupHeadsCollector);
++                    OpenBitSet groupedBitSet = termAllGroupHeadsCollector.retrieveGroupHeads(searchContext.searcher().maxDoc());
++                    searchContext.groupedDocSet(new OpenBitDocSet(groupedBitSet));
++                    for (FacetCollector facetCollector : facetCollectors) {
++                        if (!facetCollector.grouped()) {
++                            continue;
++                        }
++                        facetCollector.setFilter(new BitSetFilter(groupedBitSet, searcher));
++                    }
++                }
++
++                TermFirstPassGroupingCollector firstPassGroupingCollector = new TermFirstPassGroupingCollector(searchContext.groupField(), _sort, numDocs);
++                TermAllGroupsCollector groupCountCollector = new TermAllGroupsCollector(searchContext.groupField());
++                searcher.search(query, searchContext.parsedFilter(), MultiCollector.wrap(firstPassGroupingCollector, groupCountCollector));
++                int totalGroupedHits = groupCountCollector.getGroupCount();
++
++                Collection<SearchGroup<String>> searchGroups = firstPassGroupingCollector.getTopGroups(0, false);
++                if (searchGroups == null || searchGroups.isEmpty()) {
++                    if (searchContext.searcher().hasCollectors(ContextIndexSearcher.Scopes.MAIN) ||
++                            searchContext.searcher().hasCollectors(ContextIndexSearcher.Scopes.GLOBAL)) {
++                        searchContext.searcher().search(query, searchContext.parsedFilter(), EmptyCollector.INSTANCE); // For scoped collectors
++                    }
++                    topDocs = new TopDocs(totalGroupedHits, new ScoreDoc[0], 0.0f);
++                } else {
++                    TermSecondPassGroupingCollector secondPassGroupingCollector = new TermSecondPassGroupingCollector(searchContext.groupField(), searchGroups, _sort, _sort, 2, true, true, false);
++
++                    searchContext.searcher().search(query, null, secondPassGroupingCollector);
++                    TopGroups<String> topGroups = secondPassGroupingCollector.getTopGroups(0);
++                    List<ScoreDoc> scoreDocList = new ArrayList<ScoreDoc>(topGroups.groups.length);
++                    for (int i = 0; i < topGroups.groups.length; i++) {
++                        if (topGroups.groups[i].scoreDocs.length < 1) {
++                            continue;
++                        }
++
++                        scoreDocList.add(topGroups.groups[i].scoreDocs[0]);
++                        if (topGroups.groups[i].scoreDocs.length > 1) {
++                            searchContext.queryResult().documentGrouped().add(topGroups.groups[i].scoreDocs[0].doc);
++                        }
++                    }
++                    ScoreDoc[] scoreDocs = scoreDocList.toArray(new ScoreDoc[scoreDocList.size()]);
++                    topDocs = new TopDocs(totalGroupedHits, scoreDocs, 0.0f);
++                }
+             } else if (sort) {
+                 topDocs = searchContext.searcher().search(query, null, numDocs, searchContext.sort());
+             } else {
+@@ -308,4 +385,81 @@
+             }
+         }
+     }
++
++
++    static class EmptyCollector extends Collector {
++
++        static EmptyCollector INSTANCE = new EmptyCollector();
++
++        private EmptyCollector(){}
++
++        @Override public void setScorer(Scorer scorer) throws IOException {}
++
++        @Override public void collect(int doc) throws IOException {}
++
++        @Override public void setNextReader(IndexReader reader, int docBase) throws IOException {}
++
++        @Override public boolean acceptsDocsOutOfOrder() {return true;}
++    }
++
++
++    class BitSetFilter extends Filter {
++
++        private final OpenBitSet bitSet;
++        private final ExtendedIndexSearcher indexSearcher;
++
++        BitSetFilter(OpenBitSet bitSet, ExtendedIndexSearcher indexSearcher) {
++            this.bitSet = bitSet;
++            this.indexSearcher = indexSearcher;
++        }
++
++        @Override public DocIdSet getDocIdSet(IndexReader reader) throws IOException {
++            if (indexSearcher.getIndexReader() == reader) {
++                return bitSet;
++            }
++            int offset = 0;
++            for (int i = 0; i < indexSearcher.subReaders().length; i++) {
++                if (indexSearcher.subReaders()[i] == reader) {
++                    offset = indexSearcher.docStarts()[i];
++                    break;
++                }
++            }
++            final int base = offset;
++            final int max = reader.maxDoc();
++            return new DocIdSet() {
++
++                @Override public DocIdSetIterator iterator() throws IOException {
++                    return new DocIdSetIterator() {
++                        int pos = base - 1;
++                        int adjustedDoc = -1;
++
++                        @Override
++                        public int docID() {
++                            return adjustedDoc;
++                        }
++
++                        @Override
++                        public int nextDoc() throws IOException {
++                            pos = bitSet.nextSetBit(pos + 1);
++                            return adjustedDoc = (pos >= 0 && pos < max) ? pos - base : NO_MORE_DOCS;
++                        }
++
++                        @Override
++                        public int advance(int target) throws IOException {
++                            if (target == NO_MORE_DOCS) return adjustedDoc = NO_MORE_DOCS;
++                            pos = bitSet.nextSetBit(target + base);
++                            return adjustedDoc = (pos >= 0 && pos < max) ? pos - base : NO_MORE_DOCS;
++                        }
++                    };
++                }
++
++                @Override public boolean isCacheable() {
++                    return true;
++                }
++            };
++        }
++
++
++    }
++
+ }
+diff -Nur elasticsearch-elasticsearch-1c16e45.orig/modules/elasticsearch/src/main/java/org/elasticsearch/search/query/QuerySearchResult.java elasticsearch-elasticsearch-1c16e45/modules/elasticsearch/src/main/java/org/elasticsearch/search/query/QuerySearchResult.java
+--- elasticsearch-elasticsearch-1c16e45.orig/modules/elasticsearch/src/main/java/org/elasticsearch/search/query/QuerySearchResult.java	2011-09-19 08:06:18.000000000 +0200
++++ elasticsearch-elasticsearch-1c16e45/modules/elasticsearch/src/main/java/org/elasticsearch/search/query/QuerySearchResult.java	2011-10-13 08:59:48.000000000 +0200
+@@ -20,6 +20,7 @@
+ package org.elasticsearch.search.query;
+ 
+ import org.apache.lucene.search.TopDocs;
++import org.apache.lucene.search.grouping.TopGroups;
+ import org.elasticsearch.common.io.stream.StreamInput;
+ import org.elasticsearch.common.io.stream.StreamOutput;
+ import org.elasticsearch.common.io.stream.Streamable;
+@@ -28,6 +29,10 @@
+ import org.elasticsearch.search.facet.InternalFacets;
+ 
+ import java.io.IOException;
++import java.util.HashMap;
++import java.util.HashSet;
++import java.util.Map;
++import java.util.Set;
+ 
+ import static org.elasticsearch.common.lucene.Lucene.*;
+ 
+@@ -46,6 +51,10 @@
+ 
+     private TopDocs topDocs;
+ 
++    private TopGroups<String> topGroups;
++
++    private final Set<Integer> documentGrouped = new HashSet<Integer>();
++
+     private InternalFacets facets;
+ 
+     private boolean searchTimedOut;
+@@ -95,6 +104,18 @@
+         this.topDocs = topDocs;
+     }
+ 
++    public Set<Integer> documentGrouped() {
++        return documentGrouped;
++    }
++
++    public TopGroups<String> topGroups() {
++        return topGroups;
++    }
++
++    public void topGroups(TopGroups<String> topGroups) {
++        this.topGroups = topGroups;
++    }
++
+     public Facets facets() {
+         return facets;
+     }
+@@ -137,6 +158,10 @@
+             facets = InternalFacets.readFacets(in);
+         }
+         searchTimedOut = in.readBoolean();
++        int documentsGroupedSize = in.readVInt();
++        for (int i = 0; i < documentsGroupedSize; i++) {
++            documentGrouped.add(in.readVInt());
++        }
+     }
+ 
+     @Override public void writeTo(StreamOutput out) throws IOException {
+@@ -152,5 +177,9 @@
+             facets.writeTo(out);
+         }
+         out.writeBoolean(searchTimedOut);
++        out.writeVInt(documentGrouped.size());
++        for (Integer docId : documentGrouped) {
++            out.writeVInt(docId);
++        }
+     }
+ }
+diff -Nur elasticsearch-elasticsearch-1c16e45.orig/modules/test/integration/src/test/java/org/elasticsearch/test/integration/search/grouping/SimpleGroupingTests.java elasticsearch-elasticsearch-1c16e45/modules/test/integration/src/test/java/org/elasticsearch/test/integration/search/grouping/SimpleGroupingTests.java
+--- elasticsearch-elasticsearch-1c16e45.orig/modules/test/integration/src/test/java/org/elasticsearch/test/integration/search/grouping/SimpleGroupingTests.java	1970-01-01 01:00:00.000000000 +0100
++++ elasticsearch-elasticsearch-1c16e45/modules/test/integration/src/test/java/org/elasticsearch/test/integration/search/grouping/SimpleGroupingTests.java	2011-10-13 08:59:48.000000000 +0200
+@@ -0,0 +1,446 @@
++/*
++ * Licensed to Elastic Search and Shay Banon under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership. Elastic Search licenses this
++ * file to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++
++package org.elasticsearch.test.integration.search.grouping;
++
++import org.elasticsearch.action.search.SearchResponse;
++import org.elasticsearch.client.Client;
++import org.elasticsearch.common.settings.ImmutableSettings;
++import org.elasticsearch.common.settings.Settings;
++import org.elasticsearch.common.xcontent.XContentBuilder;
++import org.elasticsearch.index.query.FilterBuilder;
++import org.elasticsearch.index.query.FilterBuilders;
++import org.elasticsearch.search.facet.terms.TermsFacet;
++import org.elasticsearch.test.integration.AbstractNodesTests;
++import org.testng.annotations.AfterClass;
++import org.testng.annotations.AfterMethod;
++import org.testng.annotations.BeforeClass;
++import org.testng.annotations.BeforeMethod;
++import org.testng.annotations.Test;
++
++import static org.elasticsearch.common.xcontent.XContentFactory.*;
++import static org.elasticsearch.index.query.QueryBuilders.*;
++import static org.elasticsearch.search.facet.FacetBuilders.*;
++import static org.hamcrest.MatcherAssert.*;
++import static org.hamcrest.Matchers.*;
++
++/**
++ * @author Martijn van Groningen
++ */
++public class SimpleGroupingTests extends AbstractNodesTests {
++
++    private final static int NUMBER_OF_SHARDS = 1;
++    private final static int NUMBER_OF_REPLICAS = 1;
++    private final static int NUMBER_OF_NODES = 1;
++
++    private Client client;
++
++    
++    //=== Infrastructure
++
++    @BeforeClass public void createNodes() throws Exception {
++        Settings settings = ImmutableSettings
++                .settingsBuilder()
++                .put("index.number_of_shards", NUMBER_OF_SHARDS)
++                .put("index.number_of_replicas", NUMBER_OF_REPLICAS)
++                .build();
++        for (int i = 0; i < NUMBER_OF_NODES; i++) {
++            startNode("node" + i, settings);
++        }
++        client = client("node0");
++    }
++
++    @AfterClass public void closeNodes() {
++        client.close();
++        closeAllNodes();
++    }
++
++    @BeforeMethod public void createIndices() throws Exception {
++        client.admin().indices().prepareCreate("product").addMapping(
++                "instance",
++                jsonBuilder().startObject().startObject("type").startObject("properties")
++                        .startObject("id").field("type", "string").field("store", "yes").endObject()
++                        .startObject("hash").field("type", "string").field("store", "yes").endObject()
++                        .startObject("name").field("type", "string").field("index", "not_analyzed").endObject()
++                        .endObject().endObject().endObject()
++        ).execute().actionGet();
++//        client.admin().cluster().prepareHealth().setWaitForGreenStatus().execute().actionGet();
++
++        client.prepareIndex("product", "instance")
++                .setSource(createProductInstance(1, "#1#", "Marine shirt", "red", "s"))
++                .execute()
++                .actionGet();
++        client.prepareIndex("product", "instance")
++                .setSource(createProductInstance(2, "#1#", "Marine shirt", "red", "m"))
++                .execute()
++                .actionGet();
++        client.prepareIndex("product", "instance")
++                .setSource(createProductInstance(3, "#1#", "Marine shirt", "red", "l"))
++                .execute()
++                .actionGet();
++        client.prepareIndex("product", "instance")
++                .setSource(createProductInstance(4, "#2#", "Marine shirt", "blue", "s"))
++                .execute()
++                .actionGet();
++        client.prepareIndex("product", "instance")
++                .setSource(createProductInstance(5, "#2#", "Marine shirt", "blue", "m"))
++                .execute()
++                .actionGet();
++        client.prepareIndex("product", "instance")
++                .setSource(createProductInstance(6, "#2#", "Marine shirt", "blue", "l"))
++                .execute()
++                .actionGet();
++        client.prepareIndex("product", "instance")
++                .setSource(createProductInstance(7, "#3#", "Marine shirt", "green", "s"))
++                .execute()
++                .actionGet();
++        client.admin().indices().prepareRefresh().execute().actionGet();
++    }
++
++    @AfterMethod public void deleteIndices() throws Exception {
++        client.admin().indices().prepareDelete("product").execute().actionGet();
++    }
++
++    private XContentBuilder createProductInstance(int id, String hash, String name, String colour, String size) throws Exception {
++        return jsonBuilder()
++                .startObject()
++                .field("id", id)
++                .field("hash", hash)
++                .field("colour", colour)
++                .field("size", size)
++                .field("name", name)
++                .endObject();
++    }
++
++
++    //=== Tests
++
++    @Test public void testGroupingBasic() throws Exception {
++        SearchResponse searchResponse = client.prepareSearch()
++                    .setQuery(matchAllQuery())
++                    .addField("*")
++                    .execute().actionGet();
++
++        assertThat(searchResponse.hits().getTotalHits(), equalTo(7L));
++        assertThat(searchResponse.hits().getHits().length, equalTo(7));
++
++        searchResponse = client.prepareSearch()
++                    .setQuery(matchAllQuery())
++                    .addField("*")
++                    .setGroupField("hash")
++                    .execute().actionGet();
++
++        assertThat(searchResponse.hits().getTotalHits(), equalTo(3L));
++        assertThat(searchResponse.hits().getHits().length, equalTo(3));
++
++        assertThat(searchResponse.hits().getHits()[0].field("id").getValue().toString(), equalTo("1"));
++        assertThat(searchResponse.hits().getHits()[0].field("hash").getValue().toString(), equalTo("#1#"));
++        assertThat(searchResponse.hits().getHits()[0].isGrouped(), equalTo(true));
++
++        assertThat(searchResponse.hits().getHits()[1].field("id").getValue().toString(), equalTo("4"));
++        assertThat(searchResponse.hits().getHits()[1].field("hash").getValue().toString(), equalTo("#2#"));
++        assertThat(searchResponse.hits().getHits()[1].isGrouped(), equalTo(true));
++
++        assertThat(searchResponse.hits().getHits()[2].field("id").getValue().toString(), equalTo("7"));
++        assertThat(searchResponse.hits().getHits()[2].field("hash").getValue().toString(), equalTo("#3#"));
++        assertThat(searchResponse.hits().getHits()[2].isGrouped(), equalTo(false));
++    }
++
++    @Test public void testGroupingBasicWithFilter() throws Exception {
++        SearchResponse searchResponse = client.prepareSearch()
++                    .setQuery(matchAllQuery())
++                    .setFilter(FilterBuilders.termFilter("colour", "red"))
++                    .addField("*")
++                    .execute().actionGet();
++
++        assertThat(searchResponse.hits().getTotalHits(), equalTo(3L));
++        assertThat(searchResponse.hits().getHits().length, equalTo(3));
++
++        searchResponse = client.prepareSearch()
++                    .setQuery(matchAllQuery())
++                    .setFilter(FilterBuilders.termFilter("colour", "red"))
++                    .addField("*")
++                    .setGroupField("hash")
++                    .execute().actionGet();
++
++        assertThat(searchResponse.hits().getTotalHits(), equalTo(1L));
++        assertThat(searchResponse.hits().getHits().length, equalTo(1));
++
++        assertThat(searchResponse.hits().getHits()[0].field("id").getValue().toString(), equalTo("1"));
++        assertThat(searchResponse.hits().getHits()[0].field("hash").getValue().toString(), equalTo("#1#"));
++        assertThat(searchResponse.hits().getHits()[0].isGrouped(), equalTo(true));
++    }
++
++    @Test public void testGroupingFacets() throws Exception {
++        SearchResponse searchResponse = client.prepareSearch()
++                    .setQuery(matchAllQuery())
++                    .addFacet(
++                            termsFacet("name")
++                                    .field("name")
++                                    .order(TermsFacet.ComparatorType.TERM)
++                    )
++                    .addFacet(
++                            termsFacet("colour")
++                                    .field("colour")
++                                    .order(TermsFacet.ComparatorType.TERM)
++                    )
++                    .addFacet(
++                            termsFacet("size")
++                                    .field("size")
++                                    .order(TermsFacet.ComparatorType.TERM)
++                    )
++                    .execute()
++                    .actionGet();
++
++        assertThat(searchResponse.hits().getTotalHits(), equalTo(7L));
++        assertThat(searchResponse.hits().getHits().length, equalTo(7));
++
++        TermsFacet sizeFacet = searchResponse.facets().facet("size");
++        assertThat(sizeFacet.name(), equalTo("size"));
++        assertThat(sizeFacet.entries().size(), equalTo(3));
++        assertThat(sizeFacet.entries().get(0).term(), equalTo("l"));
++        assertThat(sizeFacet.entries().get(0).count(), equalTo(2));
++        assertThat(sizeFacet.entries().get(1).term(), equalTo("m"));
++        assertThat(sizeFacet.entries().get(1).count(), equalTo(2));
++        assertThat(sizeFacet.entries().get(2).term(), equalTo("s"));
++        assertThat(sizeFacet.entries().get(2).count(), equalTo(3));
++
++        TermsFacet colorFacet = searchResponse.facets().facet("colour");
++        assertThat(colorFacet.name(), equalTo("colour"));
++        assertThat(colorFacet.entries().size(), equalTo(3));
++        assertThat(colorFacet.entries().get(0).term(), equalTo("blue"));
++        assertThat(colorFacet.entries().get(0).count(), equalTo(3));
++        assertThat(colorFacet.entries().get(1).term(), equalTo("green"));
++        assertThat(colorFacet.entries().get(1).count(), equalTo(1));
++        assertThat(colorFacet.entries().get(2).term(), equalTo("red"));
++        assertThat(colorFacet.entries().get(2).count(), equalTo(3));
++
++        TermsFacet nameFacet = searchResponse.facets().facet("name");
++        assertThat(nameFacet.name(), equalTo("name"));
++        assertThat(nameFacet.entries().size(), equalTo(1));
++        assertThat(nameFacet.entries().get(0).term(), equalTo("Marine shirt"));
++        assertThat(nameFacet.entries().get(0).count(), equalTo(7));
++
++        searchResponse = client.prepareSearch()
++                    .setQuery(matchAllQuery())
++                    .setGroupField("hash")
++                    .addFacet(
++                            termsFacet("name")
++                                    .field("name")
++                                    .grouped(true)
++                                    .order(TermsFacet.ComparatorType.TERM)
++                    )
++                    .addFacet(
++                            termsFacet("colour")
++                                    .field("colour")
++                                    .grouped(true)
++                                    .order(TermsFacet.ComparatorType.TERM)
++                    )
++                    .addFacet(
++                            termsFacet("size")
++                                    .field("size")
++                                    .order(TermsFacet.ComparatorType.TERM)
++                    )
++                    .execute().actionGet();
++
++        assertThat(searchResponse.hits().getTotalHits(), equalTo(3L));
++        assertThat(searchResponse.hits().getHits().length, equalTo(3));
++
++        sizeFacet = searchResponse.facets().facet("size");
++        assertThat(sizeFacet.name(), equalTo("size"));
++        assertThat(sizeFacet.entries().size(), equalTo(3));
++        assertThat(sizeFacet.entries().get(0).term(), equalTo("l"));
++        assertThat(sizeFacet.entries().get(0).count(), equalTo(2));
++        assertThat(sizeFacet.entries().get(1).term(), equalTo("m"));
++        assertThat(sizeFacet.entries().get(1).count(), equalTo(2));
++        assertThat(sizeFacet.entries().get(2).term(), equalTo("s"));
++        assertThat(sizeFacet.entries().get(2).count(), equalTo(3));
++
++        colorFacet = searchResponse.facets().facet("colour");
++        assertThat(colorFacet.name(), equalTo("colour"));
++        assertThat(colorFacet.entries().size(), equalTo(3));
++        assertThat(colorFacet.entries().get(0).term(), equalTo("blue"));
++        assertThat(colorFacet.entries().get(0).count(), equalTo(1));
++        assertThat(colorFacet.entries().get(1).term(), equalTo("green"));
++        assertThat(colorFacet.entries().get(1).count(), equalTo(1));
++        assertThat(colorFacet.entries().get(2).term(), equalTo("red"));
++        assertThat(colorFacet.entries().get(2).count(), equalTo(1));
++
++        nameFacet = searchResponse.facets().facet("name");
++        assertThat(nameFacet.name(), equalTo("name"));
++        assertThat(nameFacet.entries().size(), equalTo(1));
++        assertThat(nameFacet.entries().get(0).term(), equalTo("Marine shirt"));
++        assertThat(nameFacet.entries().get(0).count(), equalTo(3));
++    }
++
++    @Test public void testGroupingFacetsWithFilter() throws Exception {
++        SearchResponse searchResponse = client.prepareSearch()
++                    .setQuery(matchAllQuery())
++                    .setFilter(FilterBuilders.termFilter("colour", "red"))
++                    .addFacet(
++                            termsFacet("name")
++                                    .field("name")
++                                    .order(TermsFacet.ComparatorType.TERM)
++                    )
++                    .addFacet(
++                            termsFacet("colour")
++                                    .field("colour")
++                                    .order(TermsFacet.ComparatorType.TERM)
++                    )
++                    .addFacet(
++                            termsFacet("size")
++                                    .field("size")
++                                    .order(TermsFacet.ComparatorType.TERM)
++                    )
++                    .execute()
++                    .actionGet();
++
++        assertThat(searchResponse.hits().getTotalHits(), equalTo(3L));
++        assertThat(searchResponse.hits().getHits().length, equalTo(3));
++
++        TermsFacet sizeFacet = searchResponse.facets().facet("size");
++        assertThat(sizeFacet.name(), equalTo("size"));
++        assertThat(sizeFacet.entries().size(), equalTo(3));
++        assertThat(sizeFacet.entries().get(0).term(), equalTo("l"));
++        assertThat(sizeFacet.entries().get(0).count(), equalTo(2));
++        assertThat(sizeFacet.entries().get(1).term(), equalTo("m"));
++        assertThat(sizeFacet.entries().get(1).count(), equalTo(2));
++        assertThat(sizeFacet.entries().get(2).term(), equalTo("s"));
++        assertThat(sizeFacet.entries().get(2).count(), equalTo(3));
++
++        TermsFacet colorFacet = searchResponse.facets().facet("colour");
++        assertThat(colorFacet.name(), equalTo("colour"));
++        assertThat(colorFacet.entries().size(), equalTo(3));
++        assertThat(colorFacet.entries().get(0).term(), equalTo("blue"));
++        assertThat(colorFacet.entries().get(0).count(), equalTo(3));
++        assertThat(colorFacet.entries().get(1).term(), equalTo("green"));
++        assertThat(colorFacet.entries().get(1).count(), equalTo(1));
++        assertThat(colorFacet.entries().get(2).term(), equalTo("red"));
++        assertThat(colorFacet.entries().get(2).count(), equalTo(3));
++
++        TermsFacet nameFacet = searchResponse.facets().facet("name");
++        assertThat(nameFacet.name(), equalTo("name"));
++        assertThat(nameFacet.entries().size(), equalTo(1));
++        assertThat(nameFacet.entries().get(0).term(), equalTo("Marine shirt"));
++        assertThat(nameFacet.entries().get(0).count(), equalTo(7));
++
++        searchResponse = client.prepareSearch()
++                    .setQuery(matchAllQuery())
++                    .setFilter(FilterBuilders.termFilter("colour", "red"))
++                    .setGroupField("hash")
++                    .addFacet(
++                            termsFacet("name")
++                                    .field("name")
++                                    .grouped(true)
++                                    .order(TermsFacet.ComparatorType.TERM)
++                    )
++                    .addFacet(
++                            termsFacet("colour")
++                                    .field("colour")
++                                    .grouped(true)
++                                    .order(TermsFacet.ComparatorType.TERM)
++                    )
++                    .addFacet(
++                            termsFacet("size")
++                                    .field("size")
++                                    .order(TermsFacet.ComparatorType.TERM)
++                    )
++                    .execute().actionGet();
++
++        assertThat(searchResponse.hits().getTotalHits(), equalTo(1L));
++        assertThat(searchResponse.hits().getHits().length, equalTo(1));
++
++        sizeFacet = searchResponse.facets().facet("size");
++        assertThat(sizeFacet.name(), equalTo("size"));
++        assertThat(sizeFacet.entries().size(), equalTo(3));
++        assertThat(sizeFacet.entries().get(0).term(), equalTo("l"));
++        assertThat(sizeFacet.entries().get(0).count(), equalTo(2));
++        assertThat(sizeFacet.entries().get(1).term(), equalTo("m"));
++        assertThat(sizeFacet.entries().get(1).count(), equalTo(2));
++        assertThat(sizeFacet.entries().get(2).term(), equalTo("s"));
++        assertThat(sizeFacet.entries().get(2).count(), equalTo(3));
++
++        colorFacet = searchResponse.facets().facet("colour");
++        assertThat(colorFacet.name(), equalTo("colour"));
++        assertThat(colorFacet.entries().size(), equalTo(3));
++        assertThat(colorFacet.entries().get(0).term(), equalTo("blue"));
++        assertThat(colorFacet.entries().get(0).count(), equalTo(1));
++        assertThat(colorFacet.entries().get(1).term(), equalTo("green"));
++        assertThat(colorFacet.entries().get(1).count(), equalTo(1));
++        assertThat(colorFacet.entries().get(2).term(), equalTo("red"));
++        assertThat(colorFacet.entries().get(2).count(), equalTo(1));
++
++        nameFacet = searchResponse.facets().facet("name");
++        assertThat(nameFacet.name(), equalTo("name"));
++        assertThat(nameFacet.entries().size(), equalTo(1));
++        assertThat(nameFacet.entries().get(0).term(), equalTo("Marine shirt"));
++        assertThat(nameFacet.entries().get(0).count(), equalTo(3));
++
++        // Now with facet filter
++        searchResponse = client.prepareSearch()
++                    .setQuery(matchAllQuery())
++                    .setFilter(FilterBuilders.termFilter("colour", "red"))
++                    .setGroupField("hash")
++                    .addFacet(
++                            termsFacet("name")
++                                    .field("name")
++                                    .grouped(true)
++                                    .order(TermsFacet.ComparatorType.TERM)
++                    )
++                    .addFacet(
++                            termsFacet("colour")
++                                    .field("colour")
++                                    .grouped(true)
++                                    .facetFilter(FilterBuilders.termFilter("colour", "red"))
++                                    .order(TermsFacet.ComparatorType.TERM)
++                    )
++                    .addFacet(
++                            termsFacet("size")
++                                    .field("size")
++                                    .order(TermsFacet.ComparatorType.TERM)
++                    )
++                    .execute().actionGet();
++
++        assertThat(searchResponse.hits().getTotalHits(), equalTo(1L));
++        assertThat(searchResponse.hits().getHits().length, equalTo(1));
++
++        sizeFacet = searchResponse.facets().facet("size");
++        assertThat(sizeFacet.name(), equalTo("size"));
++        assertThat(sizeFacet.entries().size(), equalTo(3));
++        assertThat(sizeFacet.entries().get(0).term(), equalTo("l"));
++        assertThat(sizeFacet.entries().get(0).count(), equalTo(2));
++        assertThat(sizeFacet.entries().get(1).term(), equalTo("m"));
++        assertThat(sizeFacet.entries().get(1).count(), equalTo(2));
++        assertThat(sizeFacet.entries().get(2).term(), equalTo("s"));
++        assertThat(sizeFacet.entries().get(2).count(), equalTo(3));
++
++        colorFacet = searchResponse.facets().facet("colour");
++        assertThat(colorFacet.name(), equalTo("colour"));
++        assertThat(colorFacet.entries().size(), equalTo(1));
++        assertThat(colorFacet.entries().get(0).term(), equalTo("red"));
++        assertThat(colorFacet.entries().get(0).count(), equalTo(1));
++
++        nameFacet = searchResponse.facets().facet("name");
++        assertThat(nameFacet.name(), equalTo("name"));
++        assertThat(nameFacet.entries().size(), equalTo(1));
++        assertThat(nameFacet.entries().get(0).term(), equalTo("Marine shirt"));
++        assertThat(nameFacet.entries().get(0).count(), equalTo(3));
++    }
++
++}

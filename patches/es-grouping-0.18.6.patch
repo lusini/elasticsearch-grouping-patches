@@ -1,0 +1,2202 @@
+diff -Nur elasticsearch-elasticsearch-6fa3e7d.orig/build.gradle elasticsearch-elasticsearch-6fa3e7d/build.gradle
+--- elasticsearch-elasticsearch-6fa3e7d.orig/build.gradle	2012-02-09 15:29:12.000000000 +0100
++++ elasticsearch-elasticsearch-6fa3e7d/build.gradle	2012-02-09 15:30:26.000000000 +0100
+@@ -11,7 +11,7 @@
+ sdf.setTimeZone(TimeZone.getTimeZone("UTC"));
+ buildTimeStr = sdf.format(buildTime)
+ 
+-versionNumber = '0.18.6'
++versionNumber = '0.18.6-grouping'
+ 
+ explodedDistDir = new File(distsDir, 'exploded')
+ explodedDistLibDir = new File(explodedDistDir, 'lib')
+diff -Nur elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/build.gradle elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/build.gradle
+--- elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/build.gradle	2012-02-09 15:29:12.000000000 +0100
++++ elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/build.gradle	2012-02-09 15:31:02.000000000 +0100
+@@ -43,6 +43,7 @@
+     compile('org.apache.lucene:lucene-queries:3.5.0') { transitive = false }
+     compile('org.apache.lucene:lucene-memory:3.5.0') { transitive = false }
+     compile('org.apache.lucene:lucene-highlighter:3.5.0') { transitive = false }
++    compile('org.apache.lucene:lucene-grouping:3.5.0') { transitive = false }
+ }
+ 
+ configurations {
+diff -Nur elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/src/main/java/org/elasticsearch/action/count/CountRequest.java elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/src/main/java/org/elasticsearch/action/count/CountRequest.java
+--- elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/src/main/java/org/elasticsearch/action/count/CountRequest.java	2012-02-09 15:29:12.000000000 +0100
++++ elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/src/main/java/org/elasticsearch/action/count/CountRequest.java	2012-02-09 15:29:58.000000000 +0100
+@@ -63,6 +63,7 @@
+ 
+     @Nullable protected String queryHint;
+     @Nullable protected String routing;
++    private String groupField = "";
+ 
+     private byte[] querySource;
+     private int querySourceOffset;
+@@ -230,6 +231,15 @@
+         return this;
+     }
+ 
++    public CountRequest groupField(String groupField) {
++        this.groupField = groupField;
++        return this;
++    }
++
++    public String groupField() {
++        return groupField;
++    }
++
+     /**
+      * The types of documents the query will run against. Defaults to all types.
+      */
+@@ -271,6 +281,7 @@
+     @Override public void readFrom(StreamInput in) throws IOException {
+         super.readFrom(in);
+         minScore = in.readFloat();
++        groupField = in.readUTF();
+ 
+         if (in.readBoolean()) {
+             queryHint = in.readUTF();
+@@ -297,6 +308,7 @@
+     @Override public void writeTo(StreamOutput out) throws IOException {
+         super.writeTo(out);
+         out.writeFloat(minScore);
++        out.writeUTF(groupField);
+ 
+         if (queryHint == null) {
+             out.writeBoolean(false);
+diff -Nur elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/src/main/java/org/elasticsearch/action/count/ShardCountRequest.java elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/src/main/java/org/elasticsearch/action/count/ShardCountRequest.java
+--- elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/src/main/java/org/elasticsearch/action/count/ShardCountRequest.java	2012-02-09 15:29:12.000000000 +0100
++++ elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/src/main/java/org/elasticsearch/action/count/ShardCountRequest.java	2012-02-09 15:29:58.000000000 +0100
+@@ -44,6 +44,8 @@
+ 
+     @Nullable private String[] filteringAliases;
+ 
++    private String groupField;
++
+     ShardCountRequest() {
+ 
+     }
+@@ -56,6 +58,7 @@
+         this.querySourceLength = request.querySourceLength();
+         this.types = request.types();
+         this.filteringAliases = filteringAliases;
++        this.groupField = request.groupField();
+     }
+ 
+     public float minScore() {
+@@ -82,9 +85,18 @@
+         return filteringAliases;
+     }
+ 
++    public boolean grouped() {
++        return groupField != null && groupField.trim().length() > 0;
++    }
++
++    public String getGroupField() {
++        return groupField;
++    }
++
+     @Override public void readFrom(StreamInput in) throws IOException {
+         super.readFrom(in);
+         minScore = in.readFloat();
++        groupField = in.readUTF();
+         querySourceLength = in.readVInt();
+         querySourceOffset = 0;
+         querySource = new byte[querySourceLength];
+@@ -108,6 +120,7 @@
+     @Override public void writeTo(StreamOutput out) throws IOException {
+         super.writeTo(out);
+         out.writeFloat(minScore);
++        out.writeUTF(groupField);
+         out.writeVInt(querySourceLength);
+         out.writeBytes(querySource, querySourceOffset, querySourceLength);
+         out.writeVInt(types.length);
+diff -Nur elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/src/main/java/org/elasticsearch/action/count/TransportCountAction.java elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/src/main/java/org/elasticsearch/action/count/TransportCountAction.java
+--- elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/src/main/java/org/elasticsearch/action/count/TransportCountAction.java	2012-02-09 15:29:12.000000000 +0100
++++ elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/src/main/java/org/elasticsearch/action/count/TransportCountAction.java	2012-02-09 15:29:58.000000000 +0100
+@@ -121,8 +121,17 @@
+ 
+     @Override protected ShardCountResponse shardOperation(ShardCountRequest request) throws ElasticSearchException {
+         IndexShard indexShard = indicesService.indexServiceSafe(request.index()).shardSafe(request.shardId());
+-        long count = indexShard.count(request.minScore(), request.querySource(), request.querySourceOffset(), request.querySourceLength(),
+-                request.filteringAliases(), request.types());
++
++        long count;
++        if (request.grouped()) {
++            count = indexShard.count(request.minScore(), request.getGroupField(), request.querySource(),
++                    request.querySourceOffset(), request.querySourceLength(), request.filteringAliases(), request.types()
++            );
++        } else {
++            count = indexShard.count(request.minScore(), request.querySource(), request.querySourceOffset(),
++                    request.querySourceLength(), request.filteringAliases(), request.types()
++            );
++        }
+         return new ShardCountResponse(request.index(), request.shardId(), count);
+     }
+ }
+diff -Nur elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/src/main/java/org/elasticsearch/action/search/SearchType.java elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/src/main/java/org/elasticsearch/action/search/SearchType.java
+--- elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/src/main/java/org/elasticsearch/action/search/SearchType.java	2012-02-09 15:29:12.000000000 +0100
++++ elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/src/main/java/org/elasticsearch/action/search/SearchType.java	2012-02-09 15:29:58.000000000 +0100
+@@ -58,7 +58,9 @@
+     /**
+      * Only counts the results, will still execute facets and the like.
+      */
+-    COUNT((byte) 5);
++    COUNT((byte) 5),
++
++    GROUP_THEN_FETCH((byte) 6);
+ 
+     /**
+      * The default search type ({@link #QUERY_THEN_FETCH}.
+@@ -120,6 +122,8 @@
+             return SearchType.SCAN;
+         } else if ("count".equals(searchType)) {
+             return SearchType.COUNT;
++        } else if ("group".equals(searchType)) {
++            return SearchType.GROUP_THEN_FETCH;
+         } else {
+             throw new ElasticSearchIllegalArgumentException("No search type for [" + searchType + "]");
+         }
+diff -Nur elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/src/main/java/org/elasticsearch/action/search/TransportSearchAction.java elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/src/main/java/org/elasticsearch/action/search/TransportSearchAction.java
+--- elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/src/main/java/org/elasticsearch/action/search/TransportSearchAction.java	2012-02-09 15:29:12.000000000 +0100
++++ elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/src/main/java/org/elasticsearch/action/search/TransportSearchAction.java	2012-02-09 15:29:58.000000000 +0100
+@@ -94,7 +94,7 @@
+                 String[] concreteIndices = clusterState.metaData().concreteIndices(searchRequest.indices(), false, true);
+                 Map<String, Set<String>> routingMap = clusterState.metaData().resolveSearchRouting(searchRequest.routing(), searchRequest.indices());
+                 int shardCount = clusterService.operationRouting().searchShardsCount(clusterState, searchRequest.indices(), concreteIndices, searchRequest.queryHint(), routingMap, searchRequest.preference());
+-                if (shardCount == 1) {
++                if (shardCount == 1 && searchRequest.searchType() != GROUP_THEN_FETCH) {
+                     // if we only have one group, then we always want Q_A_F, no need for DFS, and no need to do THEN since we hit one shard
+                     searchRequest.searchType(QUERY_AND_FETCH);
+                 }
+@@ -112,7 +112,7 @@
+             queryThenFetchAction.execute(searchRequest, listener);
+         } else if (searchRequest.searchType() == SearchType.DFS_QUERY_AND_FETCH) {
+             dfsQueryAndFetchAction.execute(searchRequest, listener);
+-        } else if (searchRequest.searchType() == SearchType.QUERY_AND_FETCH) {
++        } else if (searchRequest.searchType() == SearchType.QUERY_AND_FETCH || searchRequest.searchType() == SearchType.GROUP_THEN_FETCH) {
+             queryAndFetchAction.execute(searchRequest, listener);
+         } else if (searchRequest.searchType() == SearchType.SCAN) {
+             scanAction.execute(searchRequest, listener);
+diff -Nur elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/src/main/java/org/elasticsearch/client/action/count/CountRequestBuilder.java elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/src/main/java/org/elasticsearch/client/action/count/CountRequestBuilder.java
+--- elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/src/main/java/org/elasticsearch/client/action/count/CountRequestBuilder.java	2012-02-09 15:29:12.000000000 +0100
++++ elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/src/main/java/org/elasticsearch/client/action/count/CountRequestBuilder.java	2012-02-09 15:29:58.000000000 +0100
+@@ -107,6 +107,11 @@
+         return this;
+     }
+ 
++    public CountRequestBuilder setGroupField(String groupField) {
++        request.groupField(groupField);
++        return this;
++    }
++
+     /**
+      * Controls the operation threading model.
+      */
+diff -Nur elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/src/main/java/org/elasticsearch/client/action/search/SearchRequestBuilder.java elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/src/main/java/org/elasticsearch/client/action/search/SearchRequestBuilder.java
+--- elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/src/main/java/org/elasticsearch/client/action/search/SearchRequestBuilder.java	2012-02-09 15:29:12.000000000 +0100
++++ elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/src/main/java/org/elasticsearch/client/action/search/SearchRequestBuilder.java	2012-02-09 15:29:58.000000000 +0100
+@@ -439,6 +439,14 @@
+     }
+ 
+     /**
++     * Enables grouping and specifies on what field to group. By default no grouping occurs.
++     */
++    public SearchRequestBuilder setGroupField(String groupField) {
++        sourceBuilder().groupField(groupField);
++        return this;
++    }
++
++    /**
+      * Adds the fields to load and return as part of the search request. If none are specified,
+      * the source of the document will be returned.
+      */
+diff -Nur elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/src/main/java/org/elasticsearch/common/lucene/Lucene.java elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/src/main/java/org/elasticsearch/common/lucene/Lucene.java
+--- elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/src/main/java/org/elasticsearch/common/lucene/Lucene.java	2012-02-09 15:29:13.000000000 +0100
++++ elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/src/main/java/org/elasticsearch/common/lucene/Lucene.java	2012-02-09 15:29:58.000000000 +0100
+@@ -28,6 +28,7 @@
+ import org.apache.lucene.index.Term;
+ import org.apache.lucene.index.TermDocs;
+ import org.apache.lucene.search.*;
++import org.apache.lucene.search.grouping.TermAllGroupsCollector;
+ import org.apache.lucene.util.Version;
+ import org.elasticsearch.common.Nullable;
+ import org.elasticsearch.common.io.stream.StreamInput;
+@@ -91,6 +92,14 @@
+         return countCollector.count();
+     }
+ 
++    public static long groupedCount(IndexSearcher searcher, String groupField, Query query, Filter filter, float minScore) throws IOException {
++        TermAllGroupsCollector groupCountCollector = new TermAllGroupsCollector(groupField);
++        MinScoreWrappingCollector outerCollector = new MinScoreWrappingCollector(minScore, groupCountCollector);
++
++        searcher.search(query, filter, outerCollector);
++        return groupCountCollector.getGroupCount();
++    }
++
+     public static int docId(IndexReader reader, Term term) throws IOException {
+         TermDocs termDocs = reader.termDocs(term);
+         try {
+@@ -455,6 +464,37 @@
+         }
+     }
+ 
++    public static class MinScoreWrappingCollector extends Collector {
++
++        private final float minScore;
++        private final Collector wrappedCollector;
++        private Scorer scorer;
++
++        public MinScoreWrappingCollector(float minScore, Collector wrappedCollector) {
++            this.minScore = minScore;
++            this.wrappedCollector = wrappedCollector;
++        }
++
++        @Override public void setScorer(Scorer scorer) throws IOException {
++            this.scorer = scorer;
++            wrappedCollector.setScorer(scorer);
++        }
++
++        @Override public void collect(int doc) throws IOException {
++            if (scorer.score() > minScore) {
++                wrappedCollector.collect(doc);
++            }
++        }
++
++        @Override public void setNextReader(IndexReader reader, int docBase) throws IOException {
++            wrappedCollector.setNextReader(reader, docBase);
++        }
++
++        @Override public boolean acceptsDocsOutOfOrder() {
++            return wrappedCollector.acceptsDocsOutOfOrder();
++        }
++    }
++
+     public static class ExistsCollector extends Collector {
+ 
+         private boolean exists;
+diff -Nur elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/src/main/java/org/elasticsearch/http/netty/NettyHttpServerTransport.java elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/src/main/java/org/elasticsearch/http/netty/NettyHttpServerTransport.java
+--- elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/src/main/java/org/elasticsearch/http/netty/NettyHttpServerTransport.java	2012-02-09 15:29:13.000000000 +0100
++++ elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/src/main/java/org/elasticsearch/http/netty/NettyHttpServerTransport.java	2012-02-09 15:29:58.000000000 +0100
+@@ -126,7 +126,7 @@
+     @Inject public NettyHttpServerTransport(Settings settings, NetworkService networkService) {
+         super(settings);
+         this.networkService = networkService;
+-        ByteSizeValue maxContentLength = componentSettings.getAsBytesSize("max_content_length", settings.getAsBytesSize("http.max_content_length", new ByteSizeValue(100, ByteSizeUnit.MB)));
++        ByteSizeValue maxContentLength = componentSettings.getAsBytesSize("max_content_length", settings.getAsBytesSize("http.max_content_length", new ByteSizeValue(1000, ByteSizeUnit.MB)));
+         this.maxChunkSize = componentSettings.getAsBytesSize("max_chunk_size", settings.getAsBytesSize("http.max_chunk_size", new ByteSizeValue(8, ByteSizeUnit.KB)));
+         this.maxHeaderSize = componentSettings.getAsBytesSize("max_header_size", settings.getAsBytesSize("http.max_header_size", new ByteSizeValue(8, ByteSizeUnit.KB)));
+         this.maxInitialLineLength = componentSettings.getAsBytesSize("max_initial_line_length", settings.getAsBytesSize("http.max_initial_line_length", new ByteSizeValue(4, ByteSizeUnit.KB)));
+diff -Nur elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/src/main/java/org/elasticsearch/index/field/data/strings/MultiValueStringFieldData.java elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/src/main/java/org/elasticsearch/index/field/data/strings/MultiValueStringFieldData.java
+--- elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/src/main/java/org/elasticsearch/index/field/data/strings/MultiValueStringFieldData.java	2012-02-09 15:29:13.000000000 +0100
++++ elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/src/main/java/org/elasticsearch/index/field/data/strings/MultiValueStringFieldData.java	2012-02-09 15:29:58.000000000 +0100
+@@ -23,6 +23,8 @@
+ import org.elasticsearch.common.Strings;
+ import org.elasticsearch.common.thread.ThreadLocals;
+ 
++import java.util.Arrays;
++
+ /**
+  * @author kimchy (shay.banon)
+  */
+@@ -108,6 +110,16 @@
+         return null;
+     }
+ 
++    @Override public int ordinal(int docId) {
++        for (int[] ordinal : ordinals) {
++            int loc = ordinal[docId];
++            if (loc != 0) {
++                return loc;
++            }
++        }
++        return 0;
++    }
++
+     @Override public String[] values(int docId) {
+         int length = 0;
+         for (int[] ordinal : ordinals) {
+diff -Nur elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/src/main/java/org/elasticsearch/index/field/data/strings/SingleValueStringFieldData.java elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/src/main/java/org/elasticsearch/index/field/data/strings/SingleValueStringFieldData.java
+--- elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/src/main/java/org/elasticsearch/index/field/data/strings/SingleValueStringFieldData.java	2012-02-09 15:29:13.000000000 +0100
++++ elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/src/main/java/org/elasticsearch/index/field/data/strings/SingleValueStringFieldData.java	2012-02-09 15:29:58.000000000 +0100
+@@ -23,6 +23,8 @@
+ import org.elasticsearch.common.Strings;
+ import org.elasticsearch.common.thread.ThreadLocals;
+ 
++import java.util.Arrays;
++
+ /**
+  * @author kimchy (shay.banon)
+  */
+@@ -76,6 +78,10 @@
+         return values[ordinals[docId]];
+     }
+ 
++    @Override public int ordinal(int docId) {
++        return ordinals()[docId];
++    }
++
+     @Override public String[] values(int docId) {
+         int loc = ordinals[docId];
+         if (loc == 0) {
+diff -Nur elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/src/main/java/org/elasticsearch/index/field/data/strings/StringFieldData.java elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/src/main/java/org/elasticsearch/index/field/data/strings/StringFieldData.java
+--- elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/src/main/java/org/elasticsearch/index/field/data/strings/StringFieldData.java	2012-02-09 15:29:13.000000000 +0100
++++ elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/src/main/java/org/elasticsearch/index/field/data/strings/StringFieldData.java	2012-02-09 15:29:58.000000000 +0100
+@@ -56,6 +56,36 @@
+ 
+     abstract public String value(int docId);
+ 
++    abstract public int ordinal(int docId);
++
++    public int binarySearchLookup(String key) {
++        // this case is the reason that Arrays.binarySearch() isn't useful.
++        if (key == null)
++            return 0;
++
++        int low = 1;
++        int high = values.length-1;
++
++        while (low <= high) {
++            int mid = (low + high) >>> 1;
++            final int cmp;
++            // this case is also the reason that Arrays.binarySearch() isn't useful.
++            if (values[mid] == null) {
++                cmp = -1;
++            } else {
++                cmp = values[mid].compareTo(key);
++            }
++
++            if (cmp < 0)
++                low = mid + 1;
++            else if (cmp > 0)
++                high = mid - 1;
++            else
++                return mid; // key found
++        }
++        return -(low + 1);  // key not found.
++    }
++
+     abstract public String[] values(int docId);
+ 
+     @Override public StringDocFieldData docFieldData(int docId) {
+diff -Nur elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/src/main/java/org/elasticsearch/index/shard/service/IndexShard.java elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/src/main/java/org/elasticsearch/index/shard/service/IndexShard.java
+--- elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/src/main/java/org/elasticsearch/index/shard/service/IndexShard.java	2012-02-09 15:29:13.000000000 +0100
++++ elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/src/main/java/org/elasticsearch/index/shard/service/IndexShard.java	2012-02-09 15:29:58.000000000 +0100
+@@ -95,6 +95,8 @@
+ 
+     long count(float minScore, byte[] querySource, int querySourceOffset, int querySourceLength, @Nullable String[] filteringAliases, String... types) throws ElasticSearchException;
+ 
++    long count(float minScore, String groupField, byte[] querySource, int querySourceOffset, int querySourceLength, @Nullable String[] filteringAliases, String... types) throws ElasticSearchException;
++
+     void refresh(Engine.Refresh refresh) throws ElasticSearchException;
+ 
+     void flush(Engine.Flush flush) throws ElasticSearchException;
+diff -Nur elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/src/main/java/org/elasticsearch/index/shard/service/InternalIndexShard.java elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/src/main/java/org/elasticsearch/index/shard/service/InternalIndexShard.java
+--- elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/src/main/java/org/elasticsearch/index/shard/service/InternalIndexShard.java	2012-02-09 15:29:13.000000000 +0100
++++ elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/src/main/java/org/elasticsearch/index/shard/service/InternalIndexShard.java	2012-02-09 15:29:58.000000000 +0100
+@@ -403,6 +403,25 @@
+         }
+     }
+ 
++    @Override public long count(float minScore, String groupField, byte[] querySource, int querySourceOffset, int querySourceLength, @Nullable String[] filteringAliases, String... types) throws ElasticSearchException {
++        readAllowed();
++        Query query = queryParserService.parse(querySource, querySourceOffset, querySourceLength).query();
++        query = filterQueryIfNeeded(query, types);
++        Filter aliasFilter = indexAliasesService.aliasFilter(filteringAliases);
++        Engine.Searcher searcher = engine.searcher();
++        try {
++            long count = Lucene.groupedCount(searcher.searcher(), groupField, query, aliasFilter, minScore);
++            if (logger.isTraceEnabled()) {
++                logger.trace("count of [{}] is [{}]", query, count);
++            }
++            return count;
++        } catch (IOException e) {
++            throw new ElasticSearchException("Failed to count query [" + query + "]", e);
++        } finally {
++            searcher.release();
++        }
++    }
++
+     @Override public void refresh(Engine.Refresh refresh) throws ElasticSearchException {
+         writeAllowed();
+         if (logger.isTraceEnabled()) {
+diff -Nur elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/src/main/java/org/elasticsearch/rest/action/search/RestSearchAction.java elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/src/main/java/org/elasticsearch/rest/action/search/RestSearchAction.java
+--- elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/src/main/java/org/elasticsearch/rest/action/search/RestSearchAction.java	2012-02-09 15:29:14.000000000 +0100
++++ elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/src/main/java/org/elasticsearch/rest/action/search/RestSearchAction.java	2012-02-09 15:29:58.000000000 +0100
+@@ -185,6 +185,11 @@
+             }
+             searchSourceBuilder.size(size);
+         }
++        
++        String groupField = request.param("group_field");
++        if (groupField != null) {
++            searchSourceBuilder.groupField(groupField);
++        }
+ 
+         if (request.hasParam("explain")) {
+             if (searchSourceBuilder == null) {
+diff -Nur elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/src/main/java/org/elasticsearch/search/SearchHit.java elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/src/main/java/org/elasticsearch/search/SearchHit.java
+--- elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/src/main/java/org/elasticsearch/search/SearchHit.java	2012-02-09 15:29:14.000000000 +0100
++++ elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/src/main/java/org/elasticsearch/search/SearchHit.java	2012-02-09 15:29:58.000000000 +0100
+@@ -96,6 +96,11 @@
+     boolean isSourceEmpty();
+ 
+     /**
++     * Is this document grouped or not.
++     */
++    boolean isGrouped();
++
++    /**
+      * The source of the document as a map (can be <tt>null</tt>).
+      */
+     Map<String, Object> getSource();
+diff -Nur elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/src/main/java/org/elasticsearch/search/builder/SearchSourceBuilder.java elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/src/main/java/org/elasticsearch/search/builder/SearchSourceBuilder.java
+--- elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/src/main/java/org/elasticsearch/search/builder/SearchSourceBuilder.java	2012-02-09 15:29:14.000000000 +0100
++++ elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/src/main/java/org/elasticsearch/search/builder/SearchSourceBuilder.java	2012-02-09 15:29:58.000000000 +0100
+@@ -107,6 +107,8 @@
+ 
+     private TObjectFloatHashMap<String> indexBoost = null;
+ 
++    private String groupField;
++    
+     private String[] stats;
+ 
+ 
+@@ -399,6 +401,11 @@
+         return this;
+     }
+ 
++    public SearchSourceBuilder groupField(String groupField) {
++        this.groupField = groupField;
++        return this;
++    }
++
+     /**
+      * Adds the fields to load and return as part of the search request. If none are specified,
+      * the source of the document will be returned.
+@@ -580,6 +587,10 @@
+             }
+         }
+ 
++        if (groupField != null) {
++            builder.field("groupField", groupField);
++        }
++
+         if (scriptFields != null) {
+             builder.startObject("script_fields");
+             for (ScriptField scriptField : scriptFields) {
+diff -Nur elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/src/main/java/org/elasticsearch/search/facet/AbstractFacetCollector.java elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/src/main/java/org/elasticsearch/search/facet/AbstractFacetCollector.java
+--- elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/src/main/java/org/elasticsearch/search/facet/AbstractFacetCollector.java	2012-02-09 15:29:14.000000000 +0100
++++ elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/src/main/java/org/elasticsearch/search/facet/AbstractFacetCollector.java	2012-02-09 15:29:58.000000000 +0100
+@@ -22,6 +22,7 @@
+ import org.apache.lucene.index.IndexReader;
+ import org.apache.lucene.search.Filter;
+ import org.apache.lucene.search.Scorer;
++import org.apache.lucene.util.FixedBitSet;
+ import org.elasticsearch.common.collect.ImmutableList;
+ import org.elasticsearch.common.lucene.docset.DocSet;
+ import org.elasticsearch.common.lucene.docset.DocSets;
+@@ -40,10 +41,28 @@
+ 
+     private DocSet docSet = null;
+ 
++    private boolean groupHeadTruncate = false;
++
++    private int docBase;
++
++    private FixedBitSet groupedResult;
++
+     public AbstractFacetCollector(String facetName) {
+         this.facetName = facetName;
+     }
+ 
++    @Override public boolean groupTruncate() {
++        return groupHeadTruncate;
++    }
++
++    public void setGroupedResultSet(FixedBitSet bitSet) {
++        groupedResult = bitSet;
++    }
++
++    @Override public void groupTruncate(boolean grouped) {
++        this.groupHeadTruncate = grouped;
++    }
++
+     public Filter getFilter() {
+         return this.filter;
+     }
+@@ -65,6 +84,7 @@
+     }
+ 
+     @Override public void setNextReader(IndexReader reader, int docBase) throws IOException {
++        this.docBase = docBase;
+         if (filter != null) {
+             docSet = DocSets.convert(reader, filter.getDocIdSet(reader));
+         }
+@@ -74,10 +94,20 @@
+     protected abstract void doSetNextReader(IndexReader reader, int docBase) throws IOException;
+ 
+     @Override public void collect(int doc) throws IOException {
+-        if (docSet == null) {
+-            doCollect(doc);
+-        } else if (docSet.get(doc)) {
+-            doCollect(doc);
++        if (groupedResult != null) {
++            if (groupedResult.get(docBase + doc)) {
++                if (docSet == null) {
++                    doCollect(doc);
++                } else if (docSet.get(doc)) {
++                    doCollect(doc);
++                }
++            }
++        } else {
++            if (docSet == null) {
++                doCollect(doc);
++            } else if (docSet.get(doc)) {
++                doCollect(doc);
++            }
+         }
+     }
+ 
+diff -Nur elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/src/main/java/org/elasticsearch/search/facet/FacetCollector.java elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/src/main/java/org/elasticsearch/search/facet/FacetCollector.java
+--- elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/src/main/java/org/elasticsearch/search/facet/FacetCollector.java	2012-02-09 15:29:14.000000000 +0100
++++ elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/src/main/java/org/elasticsearch/search/facet/FacetCollector.java	2012-02-09 15:29:58.000000000 +0100
+@@ -21,6 +21,8 @@
+ 
+ import org.apache.lucene.search.Collector;
+ import org.apache.lucene.search.Filter;
++import org.apache.lucene.util.FixedBitSet;
++import org.apache.lucene.util.OpenBitSet;
+ 
+ /**
+  * @author kimchy (shay.banon)
+@@ -30,4 +32,17 @@
+     public abstract Facet facet();
+ 
+     public abstract void setFilter(Filter filter);
++
++    public boolean groupTruncate() {
++        return false;
++    }
++
++    public void groupTruncate(boolean groupTruncate) {}
++
++    public void grouped(String groupField) {}
++
++    public boolean grouped() {
++        return false;
++    }
++
+ }
+diff -Nur elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/src/main/java/org/elasticsearch/search/facet/FacetParseElement.java elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/src/main/java/org/elasticsearch/search/facet/FacetParseElement.java
+--- elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/src/main/java/org/elasticsearch/search/facet/FacetParseElement.java	2012-02-09 15:29:14.000000000 +0100
++++ elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/src/main/java/org/elasticsearch/search/facet/FacetParseElement.java	2012-02-09 15:29:58.000000000 +0100
+@@ -77,6 +77,8 @@
+                 Filter filter = null;
+                 boolean cacheFilter = true;
+                 String nestedPath = null;
++                boolean grouped = false;
++                boolean truncateHead = false;
+                 while ((token = parser.nextToken()) != XContentParser.Token.END_OBJECT) {
+                     if (token == XContentParser.Token.FIELD_NAME) {
+                         facetFieldName = parser.currentName();
+@@ -101,6 +103,10 @@
+                             cacheFilter = parser.booleanValue();
+                         } else if ("nested".equals(facetFieldName)) {
+                             nestedPath = parser.text();
++                        } else if ("grouped".equals(facetFieldName)) {
++                            grouped = parser.booleanValue();
++                        } else if ("truncate".equals(facetFieldName)) {
++                            truncateHead = parser.booleanValue();
+                         }
+                     }
+                 }
+@@ -131,6 +137,14 @@
+                     throw new SearchParseException(context, "no facet type found for facet named [" + topLevelFieldName + "]");
+                 }
+ 
++                if (context.grouped()) {
++                    if (grouped) {
++                        facet.grouped(context.groupField());
++                    } else if (truncateHead) {
++                        facet.groupTruncate(true);
++                    }
++                }
++
+                 if (facetCollectors == null) {
+                     facetCollectors = Lists.newArrayList();
+                 }
+diff -Nur elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/src/main/java/org/elasticsearch/search/facet/terms/TermsFacetBuilder.java elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/src/main/java/org/elasticsearch/search/facet/terms/TermsFacetBuilder.java
+--- elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/src/main/java/org/elasticsearch/search/facet/terms/TermsFacetBuilder.java	2012-02-09 15:29:14.000000000 +0100
++++ elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/src/main/java/org/elasticsearch/search/facet/terms/TermsFacetBuilder.java	2012-02-09 15:29:58.000000000 +0100
+@@ -47,6 +47,9 @@
+     private String lang;
+     private Map<String, Object> params;
+     String executionHint;
++    
++    private boolean grouped;
++    private boolean truncate;
+ 
+     /**
+      * Construct a new term facet with the provided facet name.
+@@ -181,6 +184,16 @@
+         return this;
+     }
+ 
++    public TermsFacetBuilder grouped(boolean grouped) {
++        this.grouped = grouped;
++        return this;
++    }
++
++    public TermsFacetBuilder truncate(boolean truncate) {
++        this.truncate = truncate;
++        return this;
++    }
++
+     /**
+      * A parameter that will be passed to the script.
+      *
+@@ -255,7 +268,10 @@
+             builder.field("execution_hint", executionHint);
+         }
+ 
++
+         builder.endObject();
++        builder.field("grouped", grouped);
++        builder.field("truncate", truncate);
+ 
+         addFilterFacetAndGlobal(builder, params);
+ 
+diff -Nur elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/src/main/java/org/elasticsearch/search/facet/terms/strings/TermsStringOrdinalsFacetCollector.java elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/src/main/java/org/elasticsearch/search/facet/terms/strings/TermsStringOrdinalsFacetCollector.java
+--- elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/src/main/java/org/elasticsearch/search/facet/terms/strings/TermsStringOrdinalsFacetCollector.java	2012-02-09 15:29:14.000000000 +0100
++++ elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/src/main/java/org/elasticsearch/search/facet/terms/strings/TermsStringOrdinalsFacetCollector.java	2012-02-09 15:29:58.000000000 +0100
+@@ -20,6 +20,7 @@
+ package org.elasticsearch.search.facet.terms.strings;
+ 
+ import org.apache.lucene.index.IndexReader;
++import org.apache.lucene.util.FixedBitSet;
+ import org.apache.lucene.util.PriorityQueue;
+ import org.elasticsearch.ElasticSearchIllegalArgumentException;
+ import org.elasticsearch.common.CacheRecycler;
+@@ -39,6 +40,7 @@
+ import java.io.IOException;
+ import java.util.ArrayList;
+ import java.util.Arrays;
++import java.util.LinkedList;
+ import java.util.List;
+ import java.util.regex.Matcher;
+ import java.util.regex.Pattern;
+@@ -52,6 +54,10 @@
+ 
+     private final String indexFieldName;
+ 
++    private String groupFieldName;
++    private FieldDataType groupFieldType;
++    private final List<GroupedFacetHitEntry> previousHits = new LinkedList<GroupedFacetHitEntry>();
++
+     private final TermsFacet.ComparatorType comparatorType;
+ 
+     private final int size;
+@@ -75,6 +81,8 @@
+ 
+     private final Matcher matcher;
+ 
++    SearchContext context;
++
+     public TermsStringOrdinalsFacetCollector(String facetName, String fieldName, int size, TermsFacet.ComparatorType comparatorType, boolean allTerms, SearchContext context,
+                                              ImmutableSet<String> excluded, Pattern pattern) {
+         super(facetName);
+@@ -82,6 +90,7 @@
+         this.size = size;
+         this.comparatorType = comparatorType;
+         this.numberOfShards = context.numberOfShards();
++        this.context = context;
+ 
+         MapperService.SmartNameFieldMappers smartMappers = context.smartFieldMappers(fieldName);
+         if (smartMappers == null || !smartMappers.hasMapper()) {
+@@ -125,7 +134,34 @@
+             }
+         }
+         fieldData = (StringFieldData) fieldDataCache.cache(fieldDataType, reader, indexFieldName);
+-        current = new ReaderAggregator(fieldData);
++        if (grouped()) {
++            StringFieldData groupData = (StringFieldData) fieldDataCache.cache(groupFieldType, reader, groupFieldName);
++            current = new GroupedReaderAggregator(fieldData, groupData, previousHits);
++        } else {
++            current = new NonGroupedReaderAggregator(fieldData);
++        }
++    }
++
++    @Override public void grouped(String groupFieldName) {
++        MapperService.SmartNameFieldMappers smartMappers = context.smartFieldMappers(groupFieldName);
++        if (smartMappers == null || !smartMappers.hasMapper()) {
++            throw new ElasticSearchIllegalArgumentException("Field [" + groupFieldName + "] doesn't have a type, can't run terms long facet collector on it");
++        }
++        // add type filter if there is exact doc mapper associated with it
++        if (smartMappers.hasDocMapper() && smartMappers.explicitTypeInName()) {
++            setFilter(context.filterCache().cache(smartMappers.docMapper().typeFilter()));
++        }
++
++        if (smartMappers.mapper().fieldDataType() != FieldDataType.DefaultTypes.STRING) {
++            throw new ElasticSearchIllegalArgumentException("Field [" + groupFieldName + "] is not of string type, can't run terms string facet collector on it");
++        }
++
++        this.groupFieldName = smartMappers.mapper().names().indexName();
++        this.groupFieldType = smartMappers.mapper().fieldDataType();
++    }
++
++    @Override public boolean grouped() {
++        return groupFieldName != null;
+     }
+ 
+     @Override protected void doCollect(int doc) throws IOException {
+@@ -230,7 +266,7 @@
+         return new InternalStringTermsFacet(facetName, comparatorType, size, ordered, missing, total);
+     }
+ 
+-    public static class ReaderAggregator implements FieldData.OrdinalInDocProc {
++    abstract static class ReaderAggregator implements FieldData.OrdinalInDocProc {
+ 
+         final String[] values;
+         final int[] counts;
+@@ -244,11 +280,6 @@
+             this.counts = CacheRecycler.popIntArray(fieldData.values().length);
+         }
+ 
+-        @Override public void onOrdinal(int docId, int ordinal) {
+-            counts[ordinal]++;
+-            total++;
+-        }
+-
+         public boolean nextPosition() {
+             if (++position >= values.length) {
+                 return false;
+@@ -258,6 +289,71 @@
+         }
+     }
+ 
++    static class NonGroupedReaderAggregator extends ReaderAggregator {
++
++        public NonGroupedReaderAggregator(StringFieldData fieldData) {
++            super(fieldData);
++        }
++
++        @Override public void onOrdinal(int docId, int ordinal) {
++            counts[ordinal]++;
++            total++;
++        }
++    }
++
++    static class GroupedReaderAggregator extends ReaderAggregator {
++
++        final FixedBitSet checker;
++        final StringFieldData groupData;
++        final List<GroupedFacetHitEntry> previousHits;
++
++        public GroupedReaderAggregator(StringFieldData fieldData, StringFieldData groupData, List<GroupedFacetHitEntry> previousHits) {
++            super(fieldData);
++            this.groupData = groupData;
++            this.previousHits = previousHits;
++            this.checker = new FixedBitSet(groupData.values().length * values.length);
++            for (GroupedFacetHitEntry previousHit : previousHits) {
++                int facetOrdinal = fieldData.binarySearchLookup(previousHit.facetValue);
++                if (facetOrdinal < 0) {
++                    continue;
++                }
++
++                int groupOrdinal = groupData.binarySearchLookup(previousHit.groupValue);
++                if (groupOrdinal < 0) {
++                    continue;
++                }
++
++                int checkerIndex = (groupOrdinal * values.length) + facetOrdinal;
++                checker.set(checkerIndex);
++            }
++        }
++
++        @Override public void onOrdinal(int docId, int ordinal) {
++            int groupOrdinal = groupData.ordinal(docId);
++            int checkerIndex = (groupOrdinal * values.length) + ordinal;
++
++            if (!checker.get(checkerIndex)) {
++                counts[ordinal]++;
++                total++;
++                checker.set(checkerIndex);
++                previousHits.add(new GroupedFacetHitEntry(values[ordinal], groupData.values()[groupOrdinal]));
++
++            }
++        }
++    }
++
++    // To keep track of the cross segment counts
++    static class GroupedFacetHitEntry {
++
++        final String facetValue;
++        final String groupValue;
++
++        GroupedFacetHitEntry(String facetValue, String groupValue) {
++            this.facetValue = facetValue;
++            this.groupValue = groupValue;
++        }
++    }
++
+     public static class AggregatorPriorityQueue extends PriorityQueue<ReaderAggregator> {
+ 
+         public AggregatorPriorityQueue(int size) {
+diff -Nur elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/src/main/java/org/elasticsearch/search/fetch/FetchPhase.java elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/src/main/java/org/elasticsearch/search/fetch/FetchPhase.java
+--- elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/src/main/java/org/elasticsearch/search/fetch/FetchPhase.java	2012-02-09 15:29:14.000000000 +0100
++++ elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/src/main/java/org/elasticsearch/search/fetch/FetchPhase.java	2012-02-09 15:29:58.000000000 +0100
+@@ -62,6 +62,7 @@
+  */
+ public class FetchPhase implements SearchPhase {
+ 
++    private static final String GROUPED_FIELD = "###grouped###";
+     private final FetchSubPhase[] fetchSubPhases;
+ 
+     @Inject public FetchPhase(HighlightPhase highlightPhase, ScriptFieldsFetchSubPhase scriptFieldsPhase,
+@@ -128,7 +129,8 @@
+ 
+             // get the version
+ 
+-            InternalSearchHit searchHit = new InternalSearchHit(docId, uid.id(), uid.type(), source, null);
++            boolean grouped = context.queryResult().documentGrouped().contains(docId);
++            InternalSearchHit searchHit = new InternalSearchHit(docId, uid.id(), uid.type(), source, null, grouped);
+             hits[index] = searchHit;
+ 
+             for (Object oField : doc.getFields()) {
+@@ -217,6 +219,20 @@
+         context.fetchResult().hits(new InternalSearchHits(hits, context.queryResult().topDocs().totalHits, context.queryResult().topDocs().getMaxScore()));
+     }
+ 
++    private void addGroupInformation(SearchContext context, int docId, InternalSearchHit searchHit) {
++        if (searchHit.fieldsOrNull() == null) {
++            searchHit.fields(new HashMap<String, SearchHitField>(2));
++        }
++        SearchHitField hitField = searchHit.fields().get(GROUPED_FIELD);
++        if (hitField == null) {
++            hitField = new InternalSearchHitField(GROUPED_FIELD, new ArrayList<Object>(2));
++            searchHit.fields().put(GROUPED_FIELD, hitField);
++        }
++
++        boolean grouped = context.queryResult().documentGrouped().contains(docId);
++        hitField.values().add(grouped);
++    }
++
+     private byte[] extractSource(Document doc, DocumentMapper documentMapper) {
+         Fieldable sourceField = doc.getFieldable(SourceFieldMapper.NAME);
+         if (sourceField != null) {
+diff -Nur elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/src/main/java/org/elasticsearch/search/internal/InternalSearchHit.java elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/src/main/java/org/elasticsearch/search/internal/InternalSearchHit.java
+--- elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/src/main/java/org/elasticsearch/search/internal/InternalSearchHit.java	2012-02-09 15:29:14.000000000 +0100
++++ elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/src/main/java/org/elasticsearch/search/internal/InternalSearchHit.java	2012-02-09 15:29:58.000000000 +0100
+@@ -81,16 +81,23 @@
+ 
+     private Map<String, Object> sourceAsMap;
+ 
++    private boolean grouped;
++
+     private InternalSearchHit() {
+ 
+     }
+ 
+-    public InternalSearchHit(int docId, String id, String type, byte[] source, Map<String, SearchHitField> fields) {
++    public InternalSearchHit(int docId, String id, String type, byte[] source, Map<String, SearchHitField> fields, boolean grouped) {
+         this.docId = docId;
+         this.id = id;
+         this.type = type;
+         this.source = source;
+         this.fields = fields;
++        this.grouped = grouped;
++    }
++
++    @Override public boolean isGrouped() {
++        return grouped;
+     }
+ 
+     public int docId() {
+@@ -311,6 +318,7 @@
+         static final XContentBuilderString VALUE = new XContentBuilderString("value");
+         static final XContentBuilderString DESCRIPTION = new XContentBuilderString("description");
+         static final XContentBuilderString DETAILS = new XContentBuilderString("details");
++        static final XContentBuilderString _GROUPED = new XContentBuilderString("_grouped");
+     }
+ 
+     @Override public XContentBuilder toXContent(XContentBuilder builder, Params params) throws IOException {
+@@ -333,6 +341,7 @@
+         if (source != null) {
+             RestXContentBuilder.restDocumentSource(source, builder, params);
+         }
++        builder.field(Fields._GROUPED, grouped);
+         if (fields != null && !fields.isEmpty()) {
+             builder.startObject(Fields.FIELDS);
+             for (SearchHitField field : fields.values()) {
+@@ -420,6 +429,7 @@
+         id = in.readUTF();
+         type = in.readUTF();
+         version = in.readLong();
++        grouped = in.readBoolean();
+         int size = in.readVInt();
+         if (size > 0) {
+             source = new byte[size];
+@@ -553,6 +563,7 @@
+         out.writeUTF(id);
+         out.writeUTF(type);
+         out.writeLong(version);
++        out.writeBoolean(grouped);
+         if (source == null) {
+             out.writeVInt(0);
+         } else {
+diff -Nur elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/src/main/java/org/elasticsearch/search/internal/SearchContext.java elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/src/main/java/org/elasticsearch/search/internal/SearchContext.java
+--- elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/src/main/java/org/elasticsearch/search/internal/SearchContext.java	2012-02-09 15:29:14.000000000 +0100
++++ elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/src/main/java/org/elasticsearch/search/internal/SearchContext.java	2012-02-09 15:29:58.000000000 +0100
+@@ -28,6 +28,8 @@
+ import org.elasticsearch.common.collect.ImmutableList;
+ import org.elasticsearch.common.collect.Lists;
+ import org.elasticsearch.common.lease.Releasable;
++import org.elasticsearch.common.lucene.docset.DocSet;
++import org.elasticsearch.common.lucene.docset.OpenBitDocSet;
+ import org.elasticsearch.common.unit.TimeValue;
+ import org.elasticsearch.index.analysis.AnalysisService;
+ import org.elasticsearch.index.cache.field.data.FieldDataCache;
+@@ -66,6 +68,7 @@
+ public class SearchContext implements Releasable {
+ 
+     private static ThreadLocal<SearchContext> current = new ThreadLocal<SearchContext>();
++    private DocSet groupedDocSet;
+ 
+     public static void setCurrent(SearchContext value) {
+         current.set(value);
+@@ -124,6 +127,8 @@
+ 
+     private Sort sort;
+ 
++    private String groupField;
++
+     private Float minimumScore;
+ 
+     private boolean trackScores = false; // when sorting, track scores as well...
+@@ -339,6 +344,16 @@
+         return this.sort;
+     }
+ 
++    public String groupField() {
++        return groupField;
++    }
++
++    public SearchContext groupField(String groupField) {
++        this.groupField = groupField;
++        this.searchType = SearchType.GROUP_THEN_FETCH;
++        return this;
++    }
++
+     public SearchContext trackScores(boolean trackScores) {
+         this.trackScores = trackScores;
+         return this;
+@@ -532,6 +547,15 @@
+         }
+         nestedQueries.put(scope, query);
+     }
++    
++    public void groupedDocSet(DocSet groupedDocSet) {
++        this.groupedDocSet = groupedDocSet;
++    }
++
++    public DocSet groupedDocSet() {
++        return groupedDocSet;
++    }
++    
+ 
+     public MapperService.SmartNameFieldMappers smartFieldMappers(String name) {
+         return mapperService().smartName(name, request.types());
+@@ -548,4 +572,8 @@
+     public MapperService.SmartNameObjectMapper smartNameObjectMapper(String name) {
+         return mapperService().smartNameObjectMapper(name, request.types());
+     }
++
++    public boolean grouped() {
++        return groupField != null;
++    }
+ }
+diff -Nur elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/src/main/java/org/elasticsearch/search/query/GroupFieldParseElement.java elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/src/main/java/org/elasticsearch/search/query/GroupFieldParseElement.java
+--- elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/src/main/java/org/elasticsearch/search/query/GroupFieldParseElement.java	1970-01-01 01:00:00.000000000 +0100
++++ elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/src/main/java/org/elasticsearch/search/query/GroupFieldParseElement.java	2012-02-09 15:29:58.000000000 +0100
+@@ -0,0 +1,37 @@
++/*
++ * Licensed to Elastic Search and Shay Banon under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership. Elastic Search licenses this
++ * file to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++
++package org.elasticsearch.search.query;
++
++import org.elasticsearch.common.xcontent.XContentParser;
++import org.elasticsearch.search.SearchParseElement;
++import org.elasticsearch.search.internal.SearchContext;
++
++/**
++ * @author Martijn van Groningen
++ */
++public class GroupFieldParseElement implements SearchParseElement {
++
++    @Override public void parse(XContentParser parser, SearchContext context) throws Exception {
++        XContentParser.Token token = parser.currentToken();
++        if (token.isValue()) {
++            context.groupField(parser.text());
++        }
++    }
++}
+diff -Nur elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/src/main/java/org/elasticsearch/search/query/QueryPhase.java elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/src/main/java/org/elasticsearch/search/query/QueryPhase.java
+--- elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/src/main/java/org/elasticsearch/search/query/QueryPhase.java	2012-02-09 15:29:14.000000000 +0100
++++ elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/src/main/java/org/elasticsearch/search/query/QueryPhase.java	2012-02-09 15:29:58.000000000 +0100
+@@ -19,23 +19,27 @@
+ 
+ package org.elasticsearch.search.query;
+ 
++import org.apache.lucene.index.ExtendedIndexSearcher;
+ import org.apache.lucene.index.IndexReader;
+-import org.apache.lucene.search.Collector;
+-import org.apache.lucene.search.Filter;
+-import org.apache.lucene.search.FilteredQuery;
+-import org.apache.lucene.search.Query;
+-import org.apache.lucene.search.ScoreDoc;
+-import org.apache.lucene.search.Scorer;
+-import org.apache.lucene.search.SortField;
+-import org.apache.lucene.search.TopDocs;
++import org.apache.lucene.search.*;
++import org.apache.lucene.search.grouping.AbstractAllGroupHeadsCollector;
++import org.apache.lucene.search.grouping.SearchGroup;
++import org.apache.lucene.search.grouping.TermAllGroupHeadsCollector;
++import org.apache.lucene.search.grouping.TermAllGroupsCollector;
++import org.apache.lucene.search.grouping.TermFirstPassGroupingCollector;
++import org.apache.lucene.search.grouping.TermSecondPassGroupingCollector;
++import org.apache.lucene.search.grouping.TopGroups;
++import org.apache.lucene.util.FixedBitSet;
+ import org.elasticsearch.action.search.SearchType;
+ import org.elasticsearch.common.collect.ImmutableMap;
+ import org.elasticsearch.common.inject.Inject;
++import org.elasticsearch.common.lucene.docset.FixedBitDocSet;
+ import org.elasticsearch.common.lucene.search.function.BoostScoreFunction;
+ import org.elasticsearch.common.lucene.search.function.FunctionScoreQuery;
+ import org.elasticsearch.index.query.ParsedQuery;
+ import org.elasticsearch.search.SearchParseElement;
+ import org.elasticsearch.search.SearchPhase;
++import org.elasticsearch.search.facet.FacetCollector;
+ import org.elasticsearch.search.facet.FacetPhase;
+ import org.elasticsearch.search.internal.ContextIndexSearcher;
+ import org.elasticsearch.search.internal.ScopePhase;
+@@ -45,6 +49,9 @@
+ 
+ import java.io.IOException;
+ import java.util.ArrayList;
++import java.util.Collection;
++import java.util.Collections;
++import java.util.List;
+ import java.util.Map;
+ 
+ /**
+@@ -70,6 +77,7 @@
+                 .put("filterBinary", new FilterBinaryParseElement())
+                 .put("filter_binary", new FilterBinaryParseElement())
+                 .put("sort", new SortParseElement())
++                .put("groupField", new GroupFieldParseElement())
+                 .put("trackScores", new TrackScoresParseElement())
+                 .put("track_scores", new TrackScoresParseElement())
+                 .put("min_score", new MinScoreParseElement())
+@@ -211,6 +219,72 @@
+                     // all is well
+                 }
+                 topDocs = scanCollector.topDocs();
++            } else if (searchContext.searchType() == SearchType.GROUP_THEN_FETCH) {
++                boolean truncatedFacets = false;
++                List<FacetCollector> facetCollectors;
++                if (searchContext.facets() != null) {
++                    facetCollectors = searchContext.facets().facetCollectors();
++                } else {
++                    facetCollectors = Collections.emptyList();
++                }
++
++                for (FacetCollector facetCollector : facetCollectors) {
++                    if (facetCollector.groupTruncate()) {
++                        truncatedFacets = true;
++                        break;
++                    }
++                }
++
++                Sort _sort = sort ? searchContext.sort() : new Sort();
++                // Otherwise we also execute the scoped collectors in ExtendedIndexSearcher. We only need to execute them in the second phase..
++                final ExtendedIndexSearcher searcher = new ExtendedIndexSearcher(searchContext.searcher().getIndexReader());
++
++                // Because filters by default don't effect facets we need to seperately execute a search to get the grouped docset without filters
++                // So we seperate the the getting grouped docset from the main search...
++                if (truncatedFacets) {
++                    AbstractAllGroupHeadsCollector termAllGroupHeadsCollector = TermAllGroupHeadsCollector.create(searchContext.groupField(), _sort);
++                    searcher.search(query, termAllGroupHeadsCollector);
++                    
++                    FixedBitSet groupHeadBitSet = termAllGroupHeadsCollector.retrieveGroupHeads(searchContext.searcher().maxDoc());
++                    searchContext.groupedDocSet(new FixedBitDocSet(groupHeadBitSet));
++                    for (FacetCollector facetCollector : facetCollectors) {
++                        if (facetCollector.groupTruncate()) {
++                            facetCollector.setFilter(new BitSetFilter(groupHeadBitSet, searcher));
++                        }
++                    }
++                }
++
++                TermFirstPassGroupingCollector firstPassGroupingCollector = new TermFirstPassGroupingCollector(searchContext.groupField(), _sort, numDocs);
++                TermAllGroupsCollector groupCountCollector = new TermAllGroupsCollector(searchContext.groupField());
++                searcher.search(query, searchContext.parsedFilter(), MultiCollector.wrap(firstPassGroupingCollector, groupCountCollector));
++                int totalGroupedHits = groupCountCollector.getGroupCount();
++
++                Collection<SearchGroup<String>> searchGroups = firstPassGroupingCollector.getTopGroups(0, false);
++                if (searchGroups == null || searchGroups.isEmpty()) {
++                    if (searchContext.searcher().hasCollectors(ContextIndexSearcher.Scopes.MAIN) ||
++                            searchContext.searcher().hasCollectors(ContextIndexSearcher.Scopes.GLOBAL)) {
++                        searchContext.searcher().search(query, null, EmptyCollector.INSTANCE); // For scoped collectors
++                    }
++                    topDocs = new TopDocs(totalGroupedHits, new ScoreDoc[0], 0.0f);
++                } else {
++                    TermSecondPassGroupingCollector secondPassGroupingCollector = new TermSecondPassGroupingCollector(searchContext.groupField(), searchGroups, _sort, _sort, 2, true, true, false);
++
++                    searchContext.searcher().search(query, null, secondPassGroupingCollector);
++                    TopGroups<String> topGroups = secondPassGroupingCollector.getTopGroups(0);
++                    List<ScoreDoc> scoreDocList = new ArrayList<ScoreDoc>(topGroups.groups.length);
++                    for (int i = 0; i < topGroups.groups.length; i++) {
++                        if (topGroups.groups[i].scoreDocs.length < 1) {
++                            continue;
++                        }
++
++                        scoreDocList.add(topGroups.groups[i].scoreDocs[0]);
++                        if (topGroups.groups[i].scoreDocs.length > 1) {
++                            searchContext.queryResult().documentGrouped().add(topGroups.groups[i].scoreDocs[0].doc);
++                        }
++                    }
++                    ScoreDoc[] scoreDocs = scoreDocList.toArray(new ScoreDoc[scoreDocList.size()]);
++                    topDocs = new TopDocs(totalGroupedHits, scoreDocs, 0.0f);
++                }
+             } else if (sort) {
+                 topDocs = searchContext.searcher().search(query, null, numDocs, searchContext.sort());
+             } else {
+@@ -308,4 +382,85 @@
+             }
+         }
+     }
++
++
++    static class EmptyCollector extends Collector {
++
++        static EmptyCollector INSTANCE = new EmptyCollector();
++
++        private EmptyCollector(){}
++
++        @Override public void setScorer(Scorer scorer) throws IOException {}
++
++        @Override public void collect(int doc) throws IOException {}
++
++        @Override public void setNextReader(IndexReader reader, int docBase) throws IOException {}
++
++        @Override public boolean acceptsDocsOutOfOrder() {return true;}
++    }
++
++
++    class BitSetFilter extends Filter {
++
++        private final FixedBitSet bitSet;
++        private final ExtendedIndexSearcher indexSearcher;
++
++        BitSetFilter(FixedBitSet bitSet, ExtendedIndexSearcher indexSearcher) {
++            this.bitSet = bitSet;
++            this.indexSearcher = indexSearcher;
++        }
++
++        @Override public DocIdSet getDocIdSet(IndexReader reader) throws IOException {
++            if (indexSearcher.getIndexReader() == reader) {
++                return bitSet;
++            }
++            int offset = 0;
++            for (int i = 0; i < indexSearcher.subReaders().length; i++) {
++                if (indexSearcher.subReaders()[i] == reader) {
++                    offset = indexSearcher.docStarts()[i];
++                    break;
++                }
++            }
++            final int base = offset;
++            final int max = reader.maxDoc();
++            return new DocIdSet() {
++
++                @Override public DocIdSetIterator iterator() throws IOException {
++                    return new DocIdSetIterator() {
++                        int pos = base - 1;
++                        int adjustedDoc = -1;
++
++                        @Override
++                        public int docID() {
++                            return adjustedDoc;
++                        }
++
++                        @Override
++                        public int nextDoc() throws IOException {
++                            int nextSeekPos = pos + 1;
++                            if (nextSeekPos >= bitSet.length()) {
++                                return NO_MORE_DOCS;
++                            }
++                            pos = bitSet.nextSetBit(nextSeekPos);
++                            return adjustedDoc = (pos >= 0 && pos < max) ? pos - base : NO_MORE_DOCS;
++                        }
++
++                        @Override
++                        public int advance(int target) throws IOException {
++                            if (target == NO_MORE_DOCS) return adjustedDoc = NO_MORE_DOCS;
++                            pos = bitSet.nextSetBit(target + base);
++                            return adjustedDoc = (pos >= 0 && pos < max) ? pos - base : NO_MORE_DOCS;
++                        }
++                    };
++                }
++
++                @Override public boolean isCacheable() {
++                    return true;
++                }
++            };
++        }
++
++
++    }
++
+ }
+diff -Nur elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/src/main/java/org/elasticsearch/search/query/QuerySearchResult.java elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/src/main/java/org/elasticsearch/search/query/QuerySearchResult.java
+--- elasticsearch-elasticsearch-6fa3e7d.orig/modules/elasticsearch/src/main/java/org/elasticsearch/search/query/QuerySearchResult.java	2012-02-09 15:29:14.000000000 +0100
++++ elasticsearch-elasticsearch-6fa3e7d/modules/elasticsearch/src/main/java/org/elasticsearch/search/query/QuerySearchResult.java	2012-02-09 15:29:58.000000000 +0100
+@@ -20,6 +20,7 @@
+ package org.elasticsearch.search.query;
+ 
+ import org.apache.lucene.search.TopDocs;
++import org.apache.lucene.search.grouping.TopGroups;
+ import org.elasticsearch.common.io.stream.StreamInput;
+ import org.elasticsearch.common.io.stream.StreamOutput;
+ import org.elasticsearch.common.io.stream.Streamable;
+@@ -28,6 +29,10 @@
+ import org.elasticsearch.search.facet.InternalFacets;
+ 
+ import java.io.IOException;
++import java.util.HashMap;
++import java.util.HashSet;
++import java.util.Map;
++import java.util.Set;
+ 
+ import static org.elasticsearch.common.lucene.Lucene.*;
+ 
+@@ -46,6 +51,10 @@
+ 
+     private TopDocs topDocs;
+ 
++    private TopGroups<String> topGroups;
++
++    private final Set<Integer> documentGrouped = new HashSet<Integer>();
++
+     private InternalFacets facets;
+ 
+     private boolean searchTimedOut;
+@@ -95,6 +104,18 @@
+         this.topDocs = topDocs;
+     }
+ 
++    public Set<Integer> documentGrouped() {
++        return documentGrouped;
++    }
++
++    public TopGroups<String> topGroups() {
++        return topGroups;
++    }
++
++    public void topGroups(TopGroups<String> topGroups) {
++        this.topGroups = topGroups;
++    }
++
+     public Facets facets() {
+         return facets;
+     }
+@@ -137,6 +158,10 @@
+             facets = InternalFacets.readFacets(in);
+         }
+         searchTimedOut = in.readBoolean();
++        int documentsGroupedSize = in.readVInt();
++        for (int i = 0; i < documentsGroupedSize; i++) {
++            documentGrouped.add(in.readVInt());
++        }
+     }
+ 
+     @Override public void writeTo(StreamOutput out) throws IOException {
+@@ -152,5 +177,9 @@
+             facets.writeTo(out);
+         }
+         out.writeBoolean(searchTimedOut);
++        out.writeVInt(documentGrouped.size());
++        for (Integer docId : documentGrouped) {
++            out.writeVInt(docId);
++        }
+     }
+ }
+diff -Nur elasticsearch-elasticsearch-6fa3e7d.orig/modules/test/integration/src/test/java/org/elasticsearch/test/integration/search/grouping/GroupingTest.java elasticsearch-elasticsearch-6fa3e7d/modules/test/integration/src/test/java/org/elasticsearch/test/integration/search/grouping/GroupingTest.java
+--- elasticsearch-elasticsearch-6fa3e7d.orig/modules/test/integration/src/test/java/org/elasticsearch/test/integration/search/grouping/GroupingTest.java	1970-01-01 01:00:00.000000000 +0100
++++ elasticsearch-elasticsearch-6fa3e7d/modules/test/integration/src/test/java/org/elasticsearch/test/integration/search/grouping/GroupingTest.java	2012-02-09 15:29:58.000000000 +0100
+@@ -0,0 +1,373 @@
++/*
++ * Licensed to Elastic Search and Shay Banon under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership. Elastic Search licenses this
++ * file to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++
++package org.elasticsearch.test.integration.search.grouping;
++
++import static org.elasticsearch.common.xcontent.XContentFactory.jsonBuilder;
++import static org.hamcrest.Matchers.is;
++import static org.hamcrest.MatcherAssert.*;
++
++import java.util.ArrayList;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++
++import org.elasticsearch.ElasticSearchException;
++import org.elasticsearch.action.admin.indices.cache.clear.ClearIndicesCacheRequest;
++import org.elasticsearch.action.admin.indices.delete.DeleteIndexRequest;
++import org.elasticsearch.action.admin.indices.refresh.RefreshRequest;
++import org.elasticsearch.action.bulk.BulkRequest;
++import org.elasticsearch.action.count.CountResponse;
++import org.elasticsearch.action.deletebyquery.DeleteByQueryRequest;
++import org.elasticsearch.action.index.IndexRequest;
++import org.elasticsearch.action.search.SearchResponse;
++import org.elasticsearch.client.Client;
++import org.elasticsearch.client.action.count.CountRequestBuilder;
++import org.elasticsearch.client.action.search.SearchRequestBuilder;
++import org.elasticsearch.client.transport.TransportClient;
++import org.elasticsearch.common.settings.ImmutableSettings;
++import org.elasticsearch.common.settings.Settings;
++import org.elasticsearch.common.transport.InetSocketTransportAddress;
++import org.elasticsearch.common.xcontent.XContentBuilder;
++import org.elasticsearch.index.query.FilterBuilder;
++import org.elasticsearch.index.query.FilterBuilders;
++import org.elasticsearch.index.query.QueryBuilders;
++import org.elasticsearch.search.facet.FacetBuilders;
++
++import org.elasticsearch.search.facet.terms.TermsFacet;
++import org.testng.annotations.AfterClass;
++import org.testng.annotations.BeforeClass;
++import org.testng.annotations.BeforeMethod;
++import org.testng.annotations.Test;
++
++//import play.Play;
++//import play.test.FunctionalTest;
++
++public class GroupingTest /*extends FunctionalTest*/ {
++
++    private static final String INDEX = "test";
++    private static final String TYPE = "product";
++
++    Client client;
++
++    @BeforeClass public void connectAndCreateIndex() throws Exception {
++        client = createClient();
++        client.admin().indices().prepareCreate(INDEX)
++                .setSettings(
++                        ImmutableSettings.settingsBuilder()
++                                .put("index.number_of_shards", 1)
++                                .put("index.number_of_replicas", 1)
++                                .build()
++                )
++                .addMapping(
++                        TYPE,
++                        jsonBuilder().startObject().startObject("type").field("dynamic", "true").startObject("properties")
++                                .startObject("ProductId").field("type", "string").field("store", "yes").endObject()
++                                .startObject("GroupField").field("type", "string").field("store", "yes").endObject()
++                                .startObject("ProductName").field("type", "string").field("index", "not_analyzed").endObject()
++                                .startObject("Color").field("type", "string").field("index", "not_analyzed").endObject()
++                                .startObject("Size").field("type", "string").field("index", "not_analyzed").endObject()
++                                .endObject().endObject().endObject()
++                ).execute().actionGet();
++//        client.admin().cluster().prepareHealth().setWaitForGreenStatus().execute().actionGet();
++    }
++
++    @AfterClass public void closeAndDeleteIndex() {
++        client.admin().indices().prepareDelete(INDEX).execute().actionGet();
++        client.close();
++    }
++
++    public Client createClient() {
++        String host = "localhost";//Play.configuration.getProperty("elasticsearch.host", "localhost");
++        Integer port = 9300;//Integer.valueOf(Play.configuration.getProperty("elasticsearch.port", "9300"));
++        String clusterName = "elasticsearch";//Play.configuration.getProperty("elasticsearch.clustername");
++        Settings settings = ImmutableSettings.settingsBuilder().put("cluster.name", clusterName).build();
++        return new TransportClient(settings).addTransportAddress(new InetSocketTransportAddress(host, port));
++    }
++
++    @BeforeMethod
++    public void createTestProducts() throws Exception {
++        try {
++            client.deleteByQuery(new DeleteByQueryRequest(INDEX).types(TYPE).query(QueryBuilders.matchAllQuery())).actionGet();
++            client.admin().indices().refresh(new RefreshRequest(INDEX)).actionGet();
++        } catch (ElasticSearchException e) {
++        }
++
++        List<Map<String, Object>> products = new ArrayList<Map<String, Object>>();
++
++        Map<String, Object> product = new HashMap<String, Object>();
++        product.put("ProductId", "0");
++        product.put("ProductName", "Shirt Hawaii");
++        product.put("GroupField", "Image1");
++        product.put("Color", "Red");
++        product.put("Size", "40");
++        products.add(product);
++
++        product = new HashMap<String, Object>();
++        product.put("ProductId", "1");
++        product.put("ProductName", "Shirt Hawaii");
++        product.put("GroupField", "Image1");
++        product.put("Color", "Red");
++        product.put("Size", "42");
++        products.add(product);
++
++        product = new HashMap<String, Object>();
++        product.put("ProductId", "2");
++        product.put("ProductName", "Shirt Hawaii");
++        product.put("GroupField", "Image1");
++        product.put("Color", "Red");
++        product.put("Size", "44");
++        products.add(product);
++
++        product = new HashMap<String, Object>();
++        product.put("ProductId", "3");
++        product.put("ProductName", "Shirt Hawaii");
++        product.put("GroupField", "Image1");
++        product.put("Color", "Red");
++        product.put("Size", "46");
++        products.add(product);
++
++        product = new HashMap<String, Object>();
++        product.put("ProductId", "4");
++        product.put("ProductName", "Shirt Hawaii");
++        product.put("GroupField", "Image1");
++        product.put("Color", "Red");
++        product.put("Size", "48");
++        products.add(product);
++
++        product = new HashMap<String, Object>();
++        product.put("ProductId", "5");
++        product.put("ProductName", "Shirt Hawaii");
++        product.put("GroupField", "Image1");
++        product.put("Color", "Red");
++        product.put("Size", "50");
++        products.add(product);
++
++        product = new HashMap<String, Object>();
++        product.put("ProductId", "6");
++        product.put("ProductName", "Shirt Hawaii");
++        product.put("GroupField", "Image1");
++        product.put("Color", "Red");
++        product.put("Size", "52");
++        products.add(product);
++
++        product = new HashMap<String, Object>();
++        product.put("ProductId", "7");
++        product.put("ProductName", "Shirt Hawaii");
++        product.put("GroupField", "Image2");
++        product.put("Color", "Blue");
++        product.put("Size", "40");
++        products.add(product);
++
++        product = new HashMap<String, Object>();
++        product.put("ProductId", "8");
++        product.put("ProductName", "Shirt Hawaii");
++        product.put("GroupField", "Image2");
++        product.put("Color", "Blue");
++        product.put("Size", "42");
++        products.add(product);
++
++        product = new HashMap<String, Object>();
++        product.put("ProductId", "9");
++        product.put("ProductName", "Shirt Hawaii");
++        product.put("GroupField", "Image2");
++        product.put("Color", "Blue");
++        product.put("Size", "44");
++        products.add(product);
++
++        product = new HashMap<String, Object>();
++        product.put("ProductId", "10");
++        product.put("ProductName", "Shirt Hawaii");
++        product.put("GroupField", "Image2");
++        product.put("Color", "Blue");
++        product.put("Size", "46");
++        products.add(product);
++
++        product = new HashMap<String, Object>();
++        product.put("ProductId", "11");
++        product.put("ProductName", "Shirt Hawaii");
++        product.put("GroupField", "Image2");
++        product.put("Color", "Blue");
++        product.put("Size", "48");
++        products.add(product);
++
++        product = new HashMap<String, Object>();
++        product.put("ProductId", "12");
++        product.put("ProductName", "Shirt Hawaii");
++        product.put("GroupField", "Image2");
++        product.put("Color", "Blue");
++        product.put("Size", "50");
++        products.add(product);
++
++        product = new HashMap<String, Object>();
++        product.put("ProductId", "13");
++        product.put("ProductName", "Shirt Hawaii");
++        product.put("GroupField", "Image2");
++        product.put("Color", "Blue");
++        product.put("Size", "52");
++        products.add(product);
++
++        BulkRequest bulkRequest = new BulkRequest();
++        for (Map<String, Object> p : products) {
++            IndexRequest indexRequest = new IndexRequest(INDEX, TYPE, (String) p.get("ProductId"));
++            indexRequest.source(p);
++            bulkRequest.add(indexRequest);
++        }
++        client.bulk(bulkRequest).actionGet();
++        client.admin().indices().refresh(new RefreshRequest(INDEX)).actionGet();
++    }
++
++    @Test
++    public void testGroupingWithoutFilters() {
++        SearchRequestBuilder searchRequestBuilder = new SearchRequestBuilder(client)
++                .setIndices(INDEX)
++                .setTypes(TYPE)
++                .setFrom(0)
++                .setSize(3);
++        searchRequestBuilder.setQuery(QueryBuilders.matchAllQuery());
++
++        searchRequestBuilder.setGroupField("GroupField");
++
++        searchRequestBuilder.addFacet(FacetBuilders.termsFacet("Color").field("Color").size(10));
++        searchRequestBuilder.addFacet(FacetBuilders.termsFacet("Size").field("Size").size(10));
++
++        SearchResponse searchResponse = searchRequestBuilder.execute().actionGet();
++
++        assertThat("totalHits", searchResponse.getHits().getTotalHits(), is(2l));
++        assertThat("hits", searchResponse.getHits().getHits().length, is(2));
++        assertThat("first hit is grouped", searchResponse.getHits().getHits()[0].isGrouped(), is(true));
++        assertThat("second hit is grouped", searchResponse.getHits().getHits()[1].isGrouped(), is(true));
++
++        TermsFacet termsFacet = (TermsFacet) searchResponse.getFacets().facet("Color");
++        assertThat("color facet should contain red and blue", termsFacet.entries().size(), is(2));
++        for (TermsFacet.Entry entry : termsFacet.entries()) {
++            assertThat("Term facet count for" + entry.getTerm(), entry.getCount(), is(7));
++        }
++    }
++
++    @Test
++    public void testGroupingWithoutFilterAndGroupedFacets() {
++        SearchRequestBuilder searchRequestBuilder = new SearchRequestBuilder(client)
++                .setIndices(INDEX)
++                .setTypes(TYPE)
++                .setFrom(0)
++                .setSize(3);
++        searchRequestBuilder.setQuery(QueryBuilders.matchAllQuery());
++
++        searchRequestBuilder.setGroupField("GroupField");
++
++        searchRequestBuilder.addFacet(FacetBuilders.termsFacet("Color").field("Color").size(10).grouped(true));
++        searchRequestBuilder.addFacet(FacetBuilders.termsFacet("Size").field("Size").size(10));
++
++        SearchResponse searchResponse = searchRequestBuilder.execute().actionGet();
++
++        TermsFacet termsFacet = (TermsFacet) searchResponse.getFacets().facet("Color");
++        // Each facet entry should have a count of one in the color facet
++        // BUGGER HERE
++        assertThat("color facet should contain red and blue", termsFacet.entries().size(), is(2));
++        for (TermsFacet.Entry entry : termsFacet.entries()) {
++            assertThat("Term facet count for" + entry.getTerm(), entry.getCount(), is(1));
++        }
++    }
++
++    @Test
++    public void testGroupingWithFilters() {
++        SearchRequestBuilder searchRequestBuilder = new SearchRequestBuilder(client)
++                .setIndices(INDEX)
++                .setTypes(TYPE)
++                .setFrom(0)
++                .addField("*")
++                .setSize(2);
++        searchRequestBuilder.setQuery(QueryBuilders.matchAllQuery());
++
++        FilterBuilder redFilter = FilterBuilders.termsFilter("Color", "Red").filterName("Color");
++
++        // andFilter is redundant, but we build the filters dynamically in this structure
++        searchRequestBuilder.setFilter(FilterBuilders.andFilter(redFilter));
++        searchRequestBuilder.setGroupField("GroupField");
++
++        searchRequestBuilder.addFacet(FacetBuilders.termsFacet("Color").field("Color").size(10));
++        // andFilter is redundant, but we build the filters dynamically in this structure
++        searchRequestBuilder.addFacet(FacetBuilders.termsFacet("Size").field("Size").size(10).facetFilter(FilterBuilders.andFilter(redFilter)));
++
++        System.out.println(String.format("Request with filter: %s", searchRequestBuilder));
++        SearchResponse searchResponse = searchRequestBuilder.execute().actionGet();
++        System.out.println(String.format("Response with filter: %s", searchResponse));
++
++        assertThat("totalHits", searchResponse.getHits().getTotalHits(), is(1l));
++        assertThat("hits", searchResponse.getHits().getHits().length, is(1));
++        assertThat("hit is grouped", searchResponse.getHits().getHits()[0].isGrouped(), is(true));
++
++        TermsFacet termsFacet = (TermsFacet) searchResponse.getFacets().facet("Color");
++        // Each facet entry should have a count of one in the color facet
++        assertThat("color facet should contain red and blue", termsFacet.entries().size(), is(2));
++        for (TermsFacet.Entry entry : termsFacet.entries()) {
++            assertThat("Term facet count for" + entry.getTerm(), entry.getCount(), is(7));
++        }
++    }
++
++    @Test
++    public void testGroupingWithFiltersAndGroupedFacets() {
++        SearchRequestBuilder searchRequestBuilder = new SearchRequestBuilder(client)
++                .setIndices(INDEX)
++                .setTypes(TYPE)
++                .setFrom(0)
++                .setSize(2);
++        searchRequestBuilder.setQuery(QueryBuilders.matchAllQuery());
++
++        FilterBuilder redFilter = FilterBuilders.termsFilter("Color", "Red").filterName("Color");
++
++        // andFilter is redundant, but we build the filters dynamically in this structure
++        searchRequestBuilder.setFilter(FilterBuilders.andFilter(redFilter));
++        searchRequestBuilder.setGroupField("GroupField");
++
++        searchRequestBuilder.addFacet(FacetBuilders.termsFacet("Color").field("Color").size(10));
++        // andFilter is redundant, but we build the filters dynamically in this structure
++        searchRequestBuilder.addFacet(FacetBuilders.termsFacet("Size").field("Size").size(10).grouped(true).facetFilter(FilterBuilders.andFilter(redFilter)));
++
++        SearchResponse searchResponse = searchRequestBuilder.execute().actionGet();
++
++        TermsFacet termsFacet = (TermsFacet) searchResponse.getFacets().facet("Color");
++        // BUGGER HERE
++        // Each facet entry should have a count of one in the color facet
++        assertThat("color facet should contain red and blue", termsFacet.entries().size(), is(2));
++        for (TermsFacet.Entry entry : termsFacet.entries()) {
++            assertThat("Term facet count for" + entry.getTerm(), entry.getCount(), is(7));
++        }
++    }
++
++    @Test
++    public void testCountRequestWithGrouping() {
++        CountRequestBuilder searchRequestBuilder = new CountRequestBuilder(client)
++                .setIndices(INDEX)
++                .setTypes(TYPE)
++                .setQuery(QueryBuilders.matchAllQuery());
++
++
++        // Without grouping
++        CountResponse searchResponse = searchRequestBuilder.execute().actionGet();
++        assertThat("totalHits", searchResponse.count(), is(14L));
++
++        // With grouping
++        searchRequestBuilder.setGroupField("GroupField");
++        searchResponse = searchRequestBuilder.execute().actionGet();
++        assertThat("totalHits", searchResponse.count(), is(2L));
++    }
++
++}
+\ No newline at end of file
+diff -Nur elasticsearch-elasticsearch-6fa3e7d.orig/modules/test/integration/src/test/java/org/elasticsearch/test/integration/search/grouping/SimpleGroupingTests.java elasticsearch-elasticsearch-6fa3e7d/modules/test/integration/src/test/java/org/elasticsearch/test/integration/search/grouping/SimpleGroupingTests.java
+--- elasticsearch-elasticsearch-6fa3e7d.orig/modules/test/integration/src/test/java/org/elasticsearch/test/integration/search/grouping/SimpleGroupingTests.java	1970-01-01 01:00:00.000000000 +0100
++++ elasticsearch-elasticsearch-6fa3e7d/modules/test/integration/src/test/java/org/elasticsearch/test/integration/search/grouping/SimpleGroupingTests.java	2012-02-09 15:29:58.000000000 +0100
+@@ -0,0 +1,471 @@
++/*
++ * Licensed to Elastic Search and Shay Banon under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership. Elastic Search licenses this
++ * file to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++
++package org.elasticsearch.test.integration.search.grouping;
++
++import org.elasticsearch.ElasticSearchException;
++import org.elasticsearch.action.admin.indices.refresh.RefreshRequest;
++import org.elasticsearch.action.count.CountResponse;
++import org.elasticsearch.action.deletebyquery.DeleteByQueryRequest;
++import org.elasticsearch.action.search.SearchResponse;
++import org.elasticsearch.client.Client;
++import org.elasticsearch.client.action.count.CountRequestBuilder;
++import org.elasticsearch.common.settings.ImmutableSettings;
++import org.elasticsearch.common.settings.Settings;
++import org.elasticsearch.common.xcontent.XContentBuilder;
++import org.elasticsearch.index.query.FilterBuilder;
++import org.elasticsearch.index.query.FilterBuilders;
++import org.elasticsearch.index.query.QueryBuilders;
++import org.elasticsearch.search.facet.terms.TermsFacet;
++import org.elasticsearch.test.integration.AbstractNodesTests;
++import org.testng.annotations.AfterClass;
++import org.testng.annotations.AfterMethod;
++import org.testng.annotations.BeforeClass;
++import org.testng.annotations.BeforeMethod;
++import org.testng.annotations.Test;
++
++import static org.elasticsearch.common.xcontent.XContentFactory.*;
++import static org.elasticsearch.index.query.QueryBuilders.*;
++import static org.elasticsearch.search.facet.FacetBuilders.*;
++import static org.hamcrest.MatcherAssert.*;
++import static org.hamcrest.Matchers.*;
++
++/**
++ * @author Martijn van Groningen
++ */
++public class SimpleGroupingTests extends AbstractNodesTests {
++
++    private final static int NUMBER_OF_SHARDS = 1;
++    private final static int NUMBER_OF_REPLICAS = 1;
++    private final static int NUMBER_OF_NODES = 1;
++
++    private Client client;
++
++    
++    //=== Infrastructure
++
++    @BeforeClass public void createNodes() throws Exception {
++        Settings settings = ImmutableSettings
++                .settingsBuilder()
++                .put("index.number_of_shards", NUMBER_OF_SHARDS)
++                .put("index.number_of_replicas", NUMBER_OF_REPLICAS)
++                .build();
++        for (int i = 0; i < NUMBER_OF_NODES; i++) {
++            startNode("node" + i, settings);
++        }
++        client = client("node0");
++    }
++
++    @AfterClass public void closeNodes() {
++        client.close();
++        closeAllNodes();
++    }
++
++    @BeforeMethod public void createIndices() throws Exception {
++        client.admin().indices().prepareCreate("product")
++                .addMapping("instance",
++                            jsonBuilder().startObject().startObject("type").startObject("properties")
++                                    .startObject("id").field("type", "string").field("store", "yes").endObject()
++                                    .startObject("hash").field("type", "string").field("store", "yes").endObject()
++                                    .startObject("name").field("type", "string").field("index", "not_analyzed").endObject()
++                                    .endObject().endObject().endObject()
++        ).execute().actionGet();
++//        client.admin().cluster().prepareHealth().setWaitForGreenStatus().execute().actionGet();
++        addDocuments();
++        client.admin().indices().prepareRefresh().execute().actionGet();
++    }
++
++    private void addDocuments() throws Exception {
++        client.prepareIndex("product", "instance")
++                .setSource(createProductInstance(1, "#1#", "Marine shirt", "red", "s"))
++                .execute()
++                .actionGet();
++        client.prepareIndex("product", "instance")
++                .setSource(createProductInstance(2, "#1#", "Marine shirt", "red", "m"))
++                .execute()
++                .actionGet();
++        client.prepareIndex("product", "instance")
++                .setSource(createProductInstance(3, "#1#", "Marine shirt", "red", "l"))
++                .execute()
++                .actionGet();
++        client.prepareIndex("product", "instance")
++                .setSource(createProductInstance(4, "#2#", "Marine shirt", "blue", "s"))
++                .execute()
++                .actionGet();
++        client.prepareIndex("product", "instance")
++                .setSource(createProductInstance(5, "#2#", "Marine shirt", "blue", "m"))
++                .execute()
++                .actionGet();
++        client.prepareIndex("product", "instance")
++                .setSource(createProductInstance(6, "#2#", "Marine shirt", "blue", "l"))
++                .execute()
++                .actionGet();
++        client.prepareIndex("product", "instance")
++                .setSource(createProductInstance(7, "#3#", "Marine shirt", "green", "s"))
++                .execute()
++                .actionGet();
++    }
++
++    @AfterMethod public void deleteIndices() throws Exception {
++        client.admin().indices().prepareDelete("product").execute().actionGet();
++    }
++
++    private XContentBuilder createProductInstance(int id, String hash, String name, String colour, String size) throws Exception {
++        return jsonBuilder()
++                .startObject()
++                .field("id", id)
++                .field("hash", hash)
++                .field("colour", colour)
++                .field("size", size)
++                .field("name", name)
++                .endObject();
++    }
++
++
++    //=== Tests
++
++    @Test public void testGroupingBasic() throws Exception {
++        SearchResponse searchResponse = client.prepareSearch()
++                    .setQuery(matchAllQuery())
++                    .addField("*")
++                    .execute().actionGet();
++
++        assertThat(searchResponse.hits().getTotalHits(), equalTo(7L));
++        assertThat(searchResponse.hits().getHits().length, equalTo(7));
++
++        searchResponse = client.prepareSearch()
++                    .setQuery(matchAllQuery())
++                    .addField("*")
++                    .setGroupField("hash")
++                    .execute().actionGet();
++
++        assertThat(searchResponse.hits().getTotalHits(), equalTo(3L));
++        assertThat(searchResponse.hits().getHits().length, equalTo(3));
++
++        assertThat(searchResponse.hits().getHits()[0].field("id").getValue().toString(), equalTo("1"));
++        assertThat(searchResponse.hits().getHits()[0].field("hash").getValue().toString(), equalTo("#1#"));
++        assertThat(searchResponse.hits().getHits()[0].isGrouped(), equalTo(true));
++
++        assertThat(searchResponse.hits().getHits()[1].field("id").getValue().toString(), equalTo("4"));
++        assertThat(searchResponse.hits().getHits()[1].field("hash").getValue().toString(), equalTo("#2#"));
++        assertThat(searchResponse.hits().getHits()[1].isGrouped(), equalTo(true));
++
++        assertThat(searchResponse.hits().getHits()[2].field("id").getValue().toString(), equalTo("7"));
++        assertThat(searchResponse.hits().getHits()[2].field("hash").getValue().toString(), equalTo("#3#"));
++        assertThat(searchResponse.hits().getHits()[2].isGrouped(), equalTo(false));
++    }
++
++    @Test public void testGroupingBasicWithFilter() throws Exception {
++        SearchResponse searchResponse = client.prepareSearch()
++                    .setQuery(matchAllQuery())
++                    .setFilter(FilterBuilders.termFilter("colour", "red"))
++                    .addField("*")
++                    .execute().actionGet();
++
++        assertThat(searchResponse.hits().getTotalHits(), equalTo(3L));
++        assertThat(searchResponse.hits().getHits().length, equalTo(3));
++
++        searchResponse = client.prepareSearch()
++                    .setQuery(matchAllQuery())
++                    .setFilter(FilterBuilders.termFilter("colour", "red"))
++                    .addField("*")
++                    .setGroupField("hash")
++                    .execute().actionGet();
++
++        assertThat(searchResponse.hits().getTotalHits(), equalTo(1L));
++        assertThat(searchResponse.hits().getHits().length, equalTo(1));
++
++        assertThat(searchResponse.hits().getHits()[0].field("id").getValue().toString(), equalTo("1"));
++        assertThat(searchResponse.hits().getHits()[0].field("hash").getValue().toString(), equalTo("#1#"));
++        assertThat(searchResponse.hits().getHits()[0].isGrouped(), equalTo(true));
++    }
++
++    @Test public void testCountRequestWithGroupingBasicWithFilter() throws Exception {
++
++        CountResponse countResponse = client.prepareCount()
++                    .setQuery(matchAllQuery())
++                    .execute().actionGet();
++
++        assertThat(countResponse.count(), equalTo(7L));
++
++        countResponse = client.prepareCount()
++                    .setQuery(matchAllQuery())
++                    .setGroupField("hash")
++                    .execute().actionGet();
++
++        assertThat(countResponse.count(), equalTo(3L));
++    }
++
++    @Test public void testGroupingFacets() throws Exception {
++        SearchResponse searchResponse = client.prepareSearch()
++                    .setQuery(matchAllQuery())
++                    .addFacet(
++                            termsFacet("name")
++                                    .field("name")
++                                    .order(TermsFacet.ComparatorType.TERM)
++                    )
++                    .addFacet(
++                            termsFacet("colour")
++                                    .field("colour")
++                                    .order(TermsFacet.ComparatorType.TERM)
++                    )
++                    .addFacet(
++                            termsFacet("size")
++                                    .field("size")
++                                    .order(TermsFacet.ComparatorType.TERM)
++                    )
++                    .execute()
++                    .actionGet();
++
++        assertThat(searchResponse.hits().getTotalHits(), equalTo(7L));
++        assertThat(searchResponse.hits().getHits().length, equalTo(7));
++
++        TermsFacet sizeFacet = searchResponse.facets().facet("size");
++        assertThat(sizeFacet.name(), equalTo("size"));
++        assertThat(sizeFacet.entries().size(), equalTo(3));
++        assertThat(sizeFacet.entries().get(0).term(), equalTo("l"));
++        assertThat(sizeFacet.entries().get(0).count(), equalTo(2));
++        assertThat(sizeFacet.entries().get(1).term(), equalTo("m"));
++        assertThat(sizeFacet.entries().get(1).count(), equalTo(2));
++        assertThat(sizeFacet.entries().get(2).term(), equalTo("s"));
++        assertThat(sizeFacet.entries().get(2).count(), equalTo(3));
++
++        TermsFacet colorFacet = searchResponse.facets().facet("colour");
++        assertThat(colorFacet.name(), equalTo("colour"));
++        assertThat(colorFacet.entries().size(), equalTo(3));
++        assertThat(colorFacet.entries().get(0).term(), equalTo("blue"));
++        assertThat(colorFacet.entries().get(0).count(), equalTo(3));
++        assertThat(colorFacet.entries().get(1).term(), equalTo("green"));
++        assertThat(colorFacet.entries().get(1).count(), equalTo(1));
++        assertThat(colorFacet.entries().get(2).term(), equalTo("red"));
++        assertThat(colorFacet.entries().get(2).count(), equalTo(3));
++
++        TermsFacet nameFacet = searchResponse.facets().facet("name");
++        assertThat(nameFacet.name(), equalTo("name"));
++        assertThat(nameFacet.entries().size(), equalTo(1));
++        assertThat(nameFacet.entries().get(0).term(), equalTo("Marine shirt"));
++        assertThat(nameFacet.entries().get(0).count(), equalTo(7));
++
++        searchResponse = client.prepareSearch()
++                    .setQuery(matchAllQuery())
++                    .setGroupField("hash")
++                    .addFacet(
++                            termsFacet("name")
++                                    .field("name")
++                                    .grouped(true)
++                                    .order(TermsFacet.ComparatorType.TERM)
++                    )
++                    .addFacet(
++                            termsFacet("colour")
++                                    .field("colour")
++                                    .grouped(true)
++                                    .order(TermsFacet.ComparatorType.TERM)
++                    )
++                    .addFacet(
++                            termsFacet("size")
++                                    .field("size")
++                                    .order(TermsFacet.ComparatorType.TERM)
++                    )
++                    .execute().actionGet();
++
++        assertThat(searchResponse.hits().getTotalHits(), equalTo(3L));
++        assertThat(searchResponse.hits().getHits().length, equalTo(3));
++
++        sizeFacet = searchResponse.facets().facet("size");
++        assertThat(sizeFacet.name(), equalTo("size"));
++        assertThat(sizeFacet.entries().size(), equalTo(3));
++        assertThat(sizeFacet.entries().get(0).term(), equalTo("l"));
++        assertThat(sizeFacet.entries().get(0).count(), equalTo(2));
++        assertThat(sizeFacet.entries().get(1).term(), equalTo("m"));
++        assertThat(sizeFacet.entries().get(1).count(), equalTo(2));
++        assertThat(sizeFacet.entries().get(2).term(), equalTo("s"));
++        assertThat(sizeFacet.entries().get(2).count(), equalTo(3));
++
++        colorFacet = searchResponse.facets().facet("colour");
++        assertThat(colorFacet.name(), equalTo("colour"));
++        assertThat(colorFacet.entries().size(), equalTo(3));
++        assertThat(colorFacet.entries().get(0).term(), equalTo("blue"));
++        assertThat(colorFacet.entries().get(0).count(), equalTo(1));
++        assertThat(colorFacet.entries().get(1).term(), equalTo("green"));
++        assertThat(colorFacet.entries().get(1).count(), equalTo(1));
++        assertThat(colorFacet.entries().get(2).term(), equalTo("red"));
++        assertThat(colorFacet.entries().get(2).count(), equalTo(1));
++
++        nameFacet = searchResponse.facets().facet("name");
++        assertThat(nameFacet.name(), equalTo("name"));
++        assertThat(nameFacet.entries().size(), equalTo(1));
++        assertThat(nameFacet.entries().get(0).term(), equalTo("Marine shirt"));
++        assertThat(nameFacet.entries().get(0).count(), equalTo(3));
++    }
++
++    @Test public void testGroupingFacetsWithFilter() throws Exception {
++        SearchResponse searchResponse = client.prepareSearch()
++                    .setQuery(matchAllQuery())
++                    .setFilter(FilterBuilders.termFilter("colour", "red"))
++                    .addFacet(
++                            termsFacet("name")
++                                    .field("name")
++                                    .order(TermsFacet.ComparatorType.TERM)
++                    )
++                    .addFacet(
++                            termsFacet("colour")
++                                    .field("colour")
++                                    .order(TermsFacet.ComparatorType.TERM)
++                    )
++                    .addFacet(
++                            termsFacet("size")
++                                    .field("size")
++                                    .order(TermsFacet.ComparatorType.TERM)
++                    )
++                    .execute()
++                    .actionGet();
++
++        assertThat(searchResponse.hits().getTotalHits(), equalTo(3L));
++        assertThat(searchResponse.hits().getHits().length, equalTo(3));
++
++        TermsFacet sizeFacet = searchResponse.facets().facet("size");
++        assertThat(sizeFacet.name(), equalTo("size"));
++        assertThat(sizeFacet.entries().size(), equalTo(3));
++        assertThat(sizeFacet.entries().get(0).term(), equalTo("l"));
++        assertThat(sizeFacet.entries().get(0).count(), equalTo(2));
++        assertThat(sizeFacet.entries().get(1).term(), equalTo("m"));
++        assertThat(sizeFacet.entries().get(1).count(), equalTo(2));
++        assertThat(sizeFacet.entries().get(2).term(), equalTo("s"));
++        assertThat(sizeFacet.entries().get(2).count(), equalTo(3));
++
++        TermsFacet colorFacet = searchResponse.facets().facet("colour");
++        assertThat(colorFacet.name(), equalTo("colour"));
++        assertThat(colorFacet.entries().size(), equalTo(3));
++        assertThat(colorFacet.entries().get(0).term(), equalTo("blue"));
++        assertThat(colorFacet.entries().get(0).count(), equalTo(3));
++        assertThat(colorFacet.entries().get(1).term(), equalTo("green"));
++        assertThat(colorFacet.entries().get(1).count(), equalTo(1));
++        assertThat(colorFacet.entries().get(2).term(), equalTo("red"));
++        assertThat(colorFacet.entries().get(2).count(), equalTo(3));
++
++        TermsFacet nameFacet = searchResponse.facets().facet("name");
++        assertThat(nameFacet.name(), equalTo("name"));
++        assertThat(nameFacet.entries().size(), equalTo(1));
++        assertThat(nameFacet.entries().get(0).term(), equalTo("Marine shirt"));
++        assertThat(nameFacet.entries().get(0).count(), equalTo(7));
++
++        searchResponse = client.prepareSearch()
++                    .setQuery(matchAllQuery())
++                    .setFilter(FilterBuilders.termsFilter("colour", "red"))
++                    .setGroupField("hash")
++                    .addFacet(
++                            termsFacet("name")
++                                    .field("name")
++                                    .grouped(true)
++                                    .order(TermsFacet.ComparatorType.TERM)
++                    )
++                    .addFacet(
++                            termsFacet("colour")
++                                    .field("colour")
++                                    .grouped(true)
++                                    .order(TermsFacet.ComparatorType.TERM)
++                    )
++                    .addFacet(
++                            termsFacet("size")
++                                    .field("size")
++                                    .order(TermsFacet.ComparatorType.TERM)
++                    )
++                    .execute().actionGet();
++
++        assertThat(searchResponse.hits().getTotalHits(), equalTo(1L));
++        assertThat(searchResponse.hits().getHits().length, equalTo(1));
++
++        sizeFacet = searchResponse.facets().facet("size");
++        assertThat(sizeFacet.name(), equalTo("size"));
++        assertThat(sizeFacet.entries().size(), equalTo(3));
++        assertThat(sizeFacet.entries().get(0).term(), equalTo("l"));
++        assertThat(sizeFacet.entries().get(0).count(), equalTo(2));
++        assertThat(sizeFacet.entries().get(1).term(), equalTo("m"));
++        assertThat(sizeFacet.entries().get(1).count(), equalTo(2));
++        assertThat(sizeFacet.entries().get(2).term(), equalTo("s"));
++        assertThat(sizeFacet.entries().get(2).count(), equalTo(3));
++
++        colorFacet = searchResponse.facets().facet("colour");
++        assertThat(colorFacet.name(), equalTo("colour"));
++        assertThat(colorFacet.entries().size(), equalTo(3));
++        assertThat(colorFacet.entries().get(0).term(), equalTo("blue"));
++        assertThat(colorFacet.entries().get(0).count(), equalTo(1));
++        assertThat(colorFacet.entries().get(1).term(), equalTo("green"));
++        assertThat(colorFacet.entries().get(1).count(), equalTo(1));
++        assertThat(colorFacet.entries().get(2).term(), equalTo("red"));
++        assertThat(colorFacet.entries().get(2).count(), equalTo(1));
++
++        nameFacet = searchResponse.facets().facet("name");
++        assertThat(nameFacet.name(), equalTo("name"));
++        assertThat(nameFacet.entries().size(), equalTo(1));
++        assertThat(nameFacet.entries().get(0).term(), equalTo("Marine shirt"));
++        assertThat(nameFacet.entries().get(0).count(), equalTo(3));
++
++        // Now with facet filter
++        searchResponse = client.prepareSearch()
++                    .setQuery(matchAllQuery())
++                    .setFilter(FilterBuilders.termFilter("colour", "red"))
++                    .setGroupField("hash")
++                    .addFacet(
++                            termsFacet("name")
++                                    .field("name")
++                                    .grouped(true)
++                                    .order(TermsFacet.ComparatorType.TERM)
++                    )
++                    .addFacet(
++                            termsFacet("colour")
++                                    .field("colour")
++                                    .grouped(true)
++                                    .facetFilter(FilterBuilders.termFilter("colour", "red"))
++                                    .order(TermsFacet.ComparatorType.TERM)
++                    )
++                    .addFacet(
++                            termsFacet("size")
++                                    .field("size")
++                                    .order(TermsFacet.ComparatorType.TERM)
++                    )
++                    .execute().actionGet();
++
++        assertThat(searchResponse.hits().getTotalHits(), equalTo(1L));
++        assertThat(searchResponse.hits().getHits().length, equalTo(1));
++
++        sizeFacet = searchResponse.facets().facet("size");
++        assertThat(sizeFacet.name(), equalTo("size"));
++        assertThat(sizeFacet.entries().size(), equalTo(3));
++        assertThat(sizeFacet.entries().get(0).term(), equalTo("l"));
++        assertThat(sizeFacet.entries().get(0).count(), equalTo(2));
++        assertThat(sizeFacet.entries().get(1).term(), equalTo("m"));
++        assertThat(sizeFacet.entries().get(1).count(), equalTo(2));
++        assertThat(sizeFacet.entries().get(2).term(), equalTo("s"));
++        assertThat(sizeFacet.entries().get(2).count(), equalTo(3));
++
++        colorFacet = searchResponse.facets().facet("colour");
++        assertThat(colorFacet.name(), equalTo("colour"));
++        assertThat(colorFacet.entries().size(), equalTo(1));
++        assertThat(colorFacet.entries().get(0).term(), equalTo("red"));
++        assertThat(colorFacet.entries().get(0).count(), equalTo(1));
++
++        nameFacet = searchResponse.facets().facet("name");
++        assertThat(nameFacet.name(), equalTo("name"));
++        assertThat(nameFacet.entries().size(), equalTo(1));
++        assertThat(nameFacet.entries().get(0).term(), equalTo("Marine shirt"));
++        assertThat(nameFacet.entries().get(0).count(), equalTo(3));
++    }
++
++}
+\ No newline at end of file
