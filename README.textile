@@ -1,0 +1,29 @@
+h1. Elasticsearch with grouping support
+
+The patches in this repository allow you to build elasticsearch with grouping support for your own tests/live deployments.
+
+Please note, that we did not write this stuff. All credits for this go to Martijn van Groningen. You can find the repository with the grouping support at https://github.com/martijnvg/elasticsearch-with-local-grouping - but it is forked from an old elasticsearch and seems not to be up-to-date.
+
+If you need some documentation, you can find it in the README of Martijns repository as well. We will provide some uses of the java client as soon as possible.
+
+h2. Building your own elasticsearch binary with grouping support
+
+* git clone git://github.com/lusini/elasticsearch-grouping-patches.git
+* cd elasticsearch-grouping-patches
+* ./build-patched-elasticsearch.sh
+* ls -l build/dist
+
+h2. Keeping it up to date
+
+In case the repo here is not up to date you can easily try to have a current version of elasticsearch yourself
+
+* Go to download and download a tag (not a binary release) <code>wget --no-check-certificate https://github.com/elasticsearch/elasticsearch/zipball/vX.YY.Z</code>
+* Unzip the source and create a copy from that in a similar named directory with an ".orig" suffix
+* Try to apply the last patch from the patches/ directory: <code>patch -p1 -i /path/to/patches/es-grouping-X.YY.Z.patch</code>
+* If the patch did not apply, check the conflicting files and change the source appropriately. When you are finished, create a new patch for the version by running
+  <code>diff -Nur es-directory.orig es-directory > /path/to/patches/es-grouping-X.YY.Z.patch</code>
+* Build a custom version of elasticsearch
+  * Before 0.19: <code>gradle clean zip</code>
+  * Since 0.19:  <code>mvn package -DskipTests</code>
+
+
